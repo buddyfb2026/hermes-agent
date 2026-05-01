@@ -515,58 +515,107 @@ class HermesJobsWorker:
             )
 
     async def _run_packet_authoring(self, row: dict) -> tuple[bool, Optional[str]]:
-        """Run the packet-authoring pipeline via ``cron.scheduler.run_job``.
+        """Run the packet-authoring pipeline through the gateway's INTERACTIVE
+        path so typing indicator, skill-load notifications, and tool-call
+        streaming all surface live in the claiming Avenger's Telegram DM.
 
-        Runs the synchronous ``run_job`` in an executor so the asyncio
-        event loop stays responsive (lease renewal, shutdown handler,
-        platform adapters).
+        We synthesize a ``MessageEvent`` for the bot's home channel and call
+        ``adapter._process_message_background`` directly (the same code path
+        invoked when Spencer DMs the bot manually). The agent runs in
+        non-quiet, non-cron mode — ``send_typing`` fires every ~2s,
+        skill-load events surface, and every tool call streams as it happens.
+
+        Reuse of ``cron.scheduler.run_job`` was the v1 design but it sets
+        ``quiet_mode=True, platform="cron"`` which suppresses streaming.
+        Visibility is non-negotiable per BIZ-208 packet §5 step 4 and the
+        operator's standing requirement.
         """
-        runner = self._runner
-        if runner is None:
-            from cron.scheduler import run_job as runner  # type: ignore[no-redef]
-
-        job_dict = build_runner_job_from_row(row, callsign=self.callsign)
-
-        # Don't even hand the runner an empty prompt — central-api should
-        # never enqueue one, but if it ever does we'd just spin the agent
-        # for nothing.
-        if not (job_dict.get("prompt") or "").strip():
+        prompt = (build_runner_job_from_row(row, callsign=self.callsign).get("prompt") or "").strip()
+        if not prompt:
             return False, "empty packet_message in payload"
 
-        loop = self.loop or asyncio.get_running_loop()
-        try:
-            success, _output_doc, final_response, error_msg = await loop.run_in_executor(
-                None, runner, job_dict,
-            )
-        except Exception as e:
-            return False, f"{type(e).__name__}: {e}"
-
-        # Post-run delivery (mirrors cron.scheduler.tick._process_job):
-        # the agent's final response is delivered to the configured target
-        # if any was resolved. The Linear-side packet_created /
-        # review_requested events are emitted by the agent's tool calls
-        # during the run, independent of this delivery.
-        if success and final_response and job_dict.get("deliver", "local") != "local":
+        # Test injection path: when a fake runner is provided, run it
+        # synchronously in an executor and skip the live-Telegram path.
+        if self._runner is not None:
+            loop = self.loop or asyncio.get_running_loop()
             try:
-                from cron.scheduler import _deliver_result, SILENT_MARKER
-                if SILENT_MARKER not in (final_response or "").strip().upper():
-                    delivery_err = _deliver_result(
-                        job_dict, final_response,
-                        adapters=self.adapters, loop=self.loop,
-                    )
-                    if delivery_err:
-                        logger.warning(
-                            "HermesJobsWorker (%s) delivery error for %s: %s",
-                            self.callsign, job_dict.get("name", "?"), delivery_err,
-                        )
-            except Exception as e:
-                # Delivery failure must not flip the row to failed — the
-                # packet itself was authored successfully (Linear events
-                # already posted by the agent's tool calls). Log and
-                # continue.
-                logger.warning(
-                    "HermesJobsWorker (%s) delivery raised for %s: %s",
-                    self.callsign, job_dict.get("name", "?"), e,
+                success, _doc, _final, error_msg = await loop.run_in_executor(
+                    None, self._runner, build_runner_job_from_row(row, callsign=self.callsign),
                 )
+                return bool(success), error_msg
+            except Exception as e:
+                return False, f"{type(e).__name__}: {e}"
 
-        return bool(success), error_msg
+        # Resolve the Telegram adapter + home channel for this profile.
+        try:
+            from gateway.config import Platform
+        except Exception as e:
+            return False, f"failed to import Platform enum: {e}"
+
+        adapter = (self.adapters or {}).get(Platform.TELEGRAM)
+        home_chat_id = (os.environ.get("TELEGRAM_HOME_CHANNEL") or "").strip()
+
+        if adapter is None:
+            return False, "Telegram adapter unavailable for this profile (cannot run with visibility)"
+        if not home_chat_id:
+            return False, "TELEGRAM_HOME_CHANNEL not set (cannot run with visibility)"
+        if not hasattr(adapter, "_process_message_background") or not hasattr(adapter, "_active_sessions"):
+            return False, f"Telegram adapter API mismatch ({type(adapter).__name__})"
+
+        # Build the synthetic event the gateway's interactive path expects.
+        try:
+            from gateway.session import SessionSource, build_session_key
+            from gateway.platforms.base import MessageEvent, MessageType
+        except Exception as e:
+            return False, f"failed to import gateway primitives: {e}"
+
+        row_id_str = str(row.get("id") or "")
+        synthetic_message_id = f"hermes-jobs-{row_id_str}"
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=str(home_chat_id),
+            chat_type="dm",
+            # In a Telegram DM, the user_id equals the chat_id (Spencer's
+            # Telegram numeric ID). Setting it makes the synthetic event
+            # pass the TELEGRAM_ALLOWED_USERS auth filter, which is
+            # gating the message_handler when user_id is None.
+            user_id=str(home_chat_id),
+            user_name=f"hermes-jobs/{self.callsign}",
+            message_id=synthetic_message_id,
+        )
+        event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=synthetic_message_id,
+        )
+        session_key = build_session_key(source)
+
+        # Pre-register the session lock the same way ``handle_message`` does
+        # before spawning the background task. ``_process_message_background``
+        # reuses this entry and cleans it up on exit.
+        if session_key in adapter._active_sessions:
+            # Another run is already active in this chat (Spencer manually
+            # DM'ing the bot, or a previous run hadn't cleaned up). Bail —
+            # the lease will expire and another idle Avenger reclaims, OR
+            # the user finishes their interaction first.
+            return False, f"chat {home_chat_id} already has an active session — try later"
+
+        interrupt_event = asyncio.Event()
+        adapter._active_sessions[session_key] = interrupt_event
+
+        logger.info(
+            "HermesJobsWorker (%s) routing %s through interactive Telegram path (session_key=%s)",
+            self.callsign, row.get("issue_key", "?"), session_key,
+        )
+
+        try:
+            await adapter._process_message_background(event, session_key)
+            return True, None
+        except Exception as e:
+            logger.exception(
+                "HermesJobsWorker (%s) interactive run failed for row %s: %s",
+                self.callsign, row_id_str, e,
+            )
+            return False, f"{type(e).__name__}: {e}"
