@@ -161,6 +161,10 @@ dependencies = [
   # devices can still slip through; they get the same resolution failure as
   # before, worked around by installing with `--no-deps` or an older release.
   "nemo-relay>=0.7.1,<0.8; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64' and 'android' not in platform_release) or (sys_platform == 'linux' and platform_machine == 'aarch64' and 'android' not in platform_release) or (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'win32' and platform_machine == 'ARM64')",
+  # BIZ-208 — Postgres client for the Hermes Avengers `hermes_jobs` poll loop.
+  # Already declared under the `matrix` extra; promoted to default so every
+  # Avenger profile gets it without a profile-by-profile install dance.
+  "asyncpg>=0.29",
 ]
 
 [project.optional-dependencies]

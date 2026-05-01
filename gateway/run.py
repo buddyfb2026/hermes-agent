@@ -30576,6 +30576,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     start_watchdog = getattr(runner, "_start_systemd_watchdog", None)
     if callable(start_watchdog):
         start_watchdog()
+    # BIZ-208 — Hermes Avengers gateway poll loop. Disabled by default;
+    # opts in via HERMES_JOBS_DATABASE_URL + a known profile callsign.
+    hermes_jobs_worker = None
+    hermes_jobs_worker_task = None
+    try:
+        from gateway.hermes_jobs_worker import HermesJobsWorker
+        hermes_jobs_worker = HermesJobsWorker.from_env(
+            adapters=runner.adapters,
+            loop=asyncio.get_running_loop(),
+        )
+        if hermes_jobs_worker is not None:
+            hermes_jobs_worker_task = asyncio.create_task(
+                hermes_jobs_worker.run(),
+                name="hermes-jobs-worker",
+            )
+    except Exception as e:
+        logger.warning("HermesJobsWorker startup raised — continuing without it: %s", e)
 
     # Wait for shutdown
     await runner.wait_for_shutdown()
@@ -30601,6 +30618,24 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # so that delivery could never run — it timed out and the message was
     # silently dropped (#58818). Awaiting keeps the loop alive so the in-flight
     # delivery finishes before we tear down.
+
+    # Stop the Hermes Avengers poll loop before cron — the worker may have
+    # an in-flight job, so give it a bounded grace period to drain.
+    if hermes_jobs_worker is not None:
+        try:
+            await hermes_jobs_worker.stop()
+        except Exception as e:
+            logger.warning("HermesJobsWorker stop raised: %s", e)
+        if hermes_jobs_worker_task is not None:
+            try:
+                await asyncio.wait_for(hermes_jobs_worker_task, timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("HermesJobsWorker did not exit within 10s — cancelling")
+                hermes_jobs_worker_task.cancel()
+            except Exception as e:
+                logger.warning("HermesJobsWorker task raised on shutdown: %s", e)
+
+    # Stop cron ticker cleanly
     cron_stop.set()
     _stop_cron_provider(cron_provider)
     if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
