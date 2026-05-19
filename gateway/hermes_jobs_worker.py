@@ -57,10 +57,30 @@ UPDATE hermes_jobs
        lease_expires_at = now() + interval '30 minutes'
  WHERE id IN (
    SELECT id FROM hermes_jobs
-    WHERE completed_at IS NULL
-      AND failed_at IS NULL
-      AND (claimed_by IS NULL OR lease_expires_at < now())
-    ORDER BY priority DESC, queued_at
+      WHERE completed_at IS NULL
+        AND failed_at IS NULL
+        AND (claimed_by IS NULL OR lease_expires_at < now())
+      AND (
+        metadata->>'exclude_callsign' IS NULL
+        OR metadata->>'exclude_callsign' = ''
+        OR metadata->>'exclude_callsign' != $1
+      )
+      AND (
+        metadata->>'preferred_callsign' IS NULL
+        OR metadata->>'preferred_callsign' = ''
+        OR metadata->>'preferred_callsign' = $1
+        OR queued_at <= now() - interval '30 seconds'
+      )
+    ORDER BY
+      CASE
+        WHEN metadata->>'preferred_callsign' IS NULL THEN 0
+        WHEN metadata->>'preferred_callsign' = '' THEN 0
+        WHEN metadata->>'preferred_callsign' = $1 THEN 0
+        WHEN queued_at <= now() - interval '30 seconds' THEN 0
+        ELSE 1
+      END,
+      priority DESC,
+      queued_at
     LIMIT 1 FOR UPDATE SKIP LOCKED
  )
  RETURNING *
@@ -94,6 +114,51 @@ UPDATE hermes_jobs
  WHERE id = $1
    AND claimed_by = $2
 """.strip()
+
+# BIZ-265 fix (2026-05-06): transient-failure release path. When the
+# worker hits a TRANSIENT failure (e.g., the chat already has an active
+# session, the lease was stolen mid-flight, etc.) we MUST NOT set
+# failed_at — that permanently disqualifies the row from re-claim and
+# Spencer's autonomous PR review/merge never runs. Instead, RELEASE the
+# claim by clearing claimed_by/claimed_at/lease_expires_at so the row
+# returns to the unclaimed pool and the next idle Avenger picks it up
+# on the very next poll tick.
+#
+# Rationale: the original docstring at line 601-605 says "the lease will
+# expire and another idle Avenger reclaims" — but that only works if
+# failed_at stays NULL. The pre-fix code path called FAIL_JOB_SQL
+# unconditionally, contradicting that intent and producing the BIZ-265
+# failure mode where Black Widow claimed a pr_review row, hit the
+# active-session pre-condition 3ms later, and the row was permanently
+# dead even though no real work had happened.
+RELEASE_JOB_SQL = """
+UPDATE hermes_jobs
+   SET claimed_by = NULL,
+       claimed_at = NULL,
+       lease_expires_at = NULL
+ WHERE id = $1
+   AND claimed_by = $2
+   AND completed_at IS NULL
+   AND failed_at IS NULL
+""".strip()
+
+# BIZ-265 fix: treat these substrings in error_msg as TRANSIENT — the
+# worker releases the claim without setting failed_at. These represent
+# pre-conditions that would resolve on the next poll (Spencer's manual
+# DM finishes, the renewal lease re-syncs, etc.) and are not real
+# implementation failures.
+TRANSIENT_FAILURE_SUBSTRINGS = (
+    "already has an active session",
+    # 2026-05-19 — when the gateway's invalidate_generation() fires
+    # mid-run (new_command from a fresh DM, manual session_reset, or
+    # another Avenger touching the same session_key), the agent's
+    # result is "Discarded as stale" before reaching Telegram and no
+    # packet artifact lands. Release the row so another idle Avenger
+    # reclaims on the next poll rather than burning the hermes_jobs
+    # row as completed-without-output. Live repro: CQI-45 v1
+    # 2026-05-19 14:02 CDT (Spiderman) — see project_hermes_update_safety.md.
+    "session interrupted",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -497,17 +562,43 @@ class HermesJobsWorker:
                     self.callsign, issue_key, packet_version,
                 )
             else:
-                async with self._pool.acquire() as conn:
-                    await conn.execute(
-                        FAIL_JOB_SQL,
-                        row_id,
-                        self.callsign,
-                        (error_msg or "unknown failure")[:8000],
-                    )
-                logger.error(
-                    "HermesJobsWorker (%s) marked %s v%s failed: %s",
-                    self.callsign, issue_key, packet_version, error_msg,
+                # BIZ-265 fix: detect transient failures and RELEASE the
+                # claim instead of marking failed. Releasing returns the
+                # row to the unclaimed pool so the next idle Avenger
+                # picks it up on the next poll — identical queue
+                # semantics to packet-authoring's "all-Avengers-busy
+                # auto-routes-to-next-available" behavior. This path
+                # specifically protects pr_review and pr_merge dispatch
+                # lanes from being permanently lost when an Avenger
+                # claims them while its chat session is busy.
+                err_lower = (error_msg or "").lower()
+                is_transient = any(
+                    pattern in err_lower
+                    for pattern in TRANSIENT_FAILURE_SUBSTRINGS
                 )
+                if is_transient:
+                    async with self._pool.acquire() as conn:
+                        await conn.execute(
+                            RELEASE_JOB_SQL,
+                            row_id,
+                            self.callsign,
+                        )
+                    logger.warning(
+                        "HermesJobsWorker (%s) released %s v%s (transient: %s) — row returned to unclaimed pool for retry",
+                        self.callsign, issue_key, packet_version, error_msg,
+                    )
+                else:
+                    async with self._pool.acquire() as conn:
+                        await conn.execute(
+                            FAIL_JOB_SQL,
+                            row_id,
+                            self.callsign,
+                            (error_msg or "unknown failure")[:8000],
+                        )
+                    logger.error(
+                        "HermesJobsWorker (%s) marked %s v%s failed: %s",
+                        self.callsign, issue_key, packet_version, error_msg,
+                    )
         except Exception as e:
             logger.exception(
                 "HermesJobsWorker (%s) failed to write completion for row %s: %s",
@@ -570,7 +661,9 @@ class HermesJobsWorker:
             return False, f"failed to import gateway primitives: {e}"
 
         row_id_str = str(row.get("id") or "")
-        synthetic_message_id = f"hermes-jobs-{row_id_str}"
+        # Use None so Telegram adapter doesn't try to reply_to a non-numeric ID.
+        # The UUID was causing int() parse failures in telegram.py line 1101.
+        synthetic_message_id = None
 
         source = SessionSource(
             platform=Platform.TELEGRAM,
@@ -612,6 +705,29 @@ class HermesJobsWorker:
 
         try:
             await adapter._process_message_background(event, session_key)
+            # 2026-05-19 fix — _process_message_background returns cleanly even
+            # when the gateway's invalidate_generation() invalidated our run
+            # mid-flight (new_command from a fresh DM, session_reset, etc.).
+            # The pre-fix code returned (True, None) here, which marked the
+            # hermes_jobs row completed_at — burning it without producing a
+            # packet artifact. Live repro: CQI-45 v1 at 14:02 CDT (Spiderman):
+            #   "Invalidated run generation ... (new_command)"
+            #   "Invalidated run generation ... (session_reset)"
+            #   "Discarding stale agent result ... generation 1 is no longer current"
+            #   followed by "Spiderman completed CQI-45 v1" — but no artifact landed.
+            #
+            # When the gateway's invalidate_generation() fires for a session_key
+            # we own, it sets the interrupt_event we registered above. After
+            # _process_message_background returns we check that event: if set,
+            # signal transient failure so _writeback_completion releases the
+            # row (via TRANSIENT_FAILURE_SUBSTRINGS match on "session interrupted")
+            # rather than marking it completed_at.
+            if interrupt_event.is_set():
+                logger.warning(
+                    "HermesJobsWorker (%s) %s: session interrupted before agent result reached Telegram — releasing row for retry",
+                    self.callsign, row.get("issue_key", "?"),
+                )
+                return False, "session interrupted: invalidate_generation fired mid-run, agent result was discarded as stale before reaching Telegram"
             return True, None
         except Exception as e:
             logger.exception(
