@@ -142,6 +142,28 @@ UPDATE hermes_jobs
    AND failed_at IS NULL
 """.strip()
 
+# BIZ-352 (2026-05-29) — rate-limit / auth no-op detection.
+#
+# ``ZERO_API_CALLS_MARKER`` is the substring that flags a packet-authoring
+# run which exited with zero *successful* model API calls (the signature of
+# a 429 / auth-dead window where the agent loop bailed before producing any
+# output). It is embedded in ``ZERO_API_CALLS_ERROR`` and also listed in
+# ``TRANSIENT_FAILURE_SUBSTRINGS`` so ``_writeback_completion`` RELEASES the
+# row (returns it to the unclaimed pool) instead of recording a fake
+# completed_at with no artifact.
+ZERO_API_CALLS_MARKER = "zero successful api calls"
+ZERO_API_CALLS_ERROR = (
+    "rate-limit/auth no-op: packet-authoring run completed with "
+    "zero successful api calls before producing output — releasing row for retry"
+)
+
+# Bounded exponential backoff applied AFTER a zero-api-calls release, so a
+# sustained 429 / auth-dead window doesn't spin every idle Avenger re-claiming
+# and re-tripping the same wall every poll tick. Reset to 0 on the next
+# successful run. Interruptible via ``_stop_event`` so shutdown stays prompt.
+RATE_LIMIT_BACKOFF_BASE_SECONDS = 30.0
+RATE_LIMIT_BACKOFF_CAP_SECONDS = 600.0
+
 # BIZ-265 fix: treat these substrings in error_msg as TRANSIENT — the
 # worker releases the claim without setting failed_at. These represent
 # pre-conditions that would resolve on the next poll (Spencer's manual
@@ -158,6 +180,13 @@ TRANSIENT_FAILURE_SUBSTRINGS = (
     # row as completed-without-output. Live repro: CQI-45 v1
     # 2026-05-19 14:02 CDT (Spiderman) — see project_hermes_update_safety.md.
     "session interrupted",
+    # BIZ-352 (2026-05-29) — a 429 / auth-failure during packet authoring
+    # makes the agent loop exit cleanly with ZERO successful API calls and
+    # no artifact. _process_message_background still returns None, so the
+    # pre-fix path recorded the row completed_at with api_calls=0. Treat a
+    # confidently-observed zero-successful-call run as transient: RELEASE so
+    # the next idle Avenger retries once the rate-limit / auth window clears.
+    ZERO_API_CALLS_MARKER,
 )
 
 
@@ -313,6 +342,9 @@ class HermesJobsWorker:
         self._stop_event = asyncio.Event()
         self._pool = None  # asyncpg.Pool
         self._current_row_id = None  # set while processing
+        # BIZ-352: bounded exponential backoff after a zero-api-calls
+        # (rate-limit / auth no-op) release. 0.0 = no backoff pending.
+        self._rate_limit_backoff_seconds = 0.0
 
     # -- Construction ---------------------------------------------------
 
@@ -426,6 +458,25 @@ class HermesJobsWorker:
                 # We hold a row — run it through the packet-authoring
                 # pipeline with lease renewal in the background.
                 await self._process_row(row)
+
+                # BIZ-352: if the run we just finished was a rate-limit /
+                # auth no-op (zero successful API calls), back off before
+                # claiming the next row so a sustained 429 window doesn't
+                # spin every idle Avenger re-tripping the same wall. The
+                # sleep is interruptible via _stop_event for prompt shutdown.
+                backoff_for = self._rate_limit_backoff_seconds
+                if backoff_for > 0:
+                    logger.warning(
+                        "HermesJobsWorker (%s) rate-limit backoff: sleeping %.0fs before next claim",
+                        self.callsign, backoff_for,
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            self._stop_event.wait(), timeout=backoff_for,
+                        )
+                        break  # stop_event was set during backoff
+                    except asyncio.TimeoutError:
+                        pass
 
         finally:
             if self._pool is not None:
@@ -544,6 +595,114 @@ class HermesJobsWorker:
         await self._writeback_completion(
             row_id, issue_key, packet_version, success, error_msg,
         )
+
+        # BIZ-352: grow/reset the rate-limit backoff based on this run's
+        # outcome. Done after writeback so the row state is already settled.
+        self._update_rate_limit_backoff(success, error_msg)
+
+    def _update_rate_limit_backoff(
+        self, success: bool, error_msg: Optional[str],
+    ) -> None:
+        """Grow the rate-limit backoff on a zero-api-calls release, reset it
+        otherwise.
+
+        A *successful* run, or any failure that is NOT the zero-api-calls
+        no-op, clears the backoff — we only want to throttle re-claims while
+        the rate-limit / auth window is actively biting. Growth is bounded
+        exponential: BASE, 2×BASE, 4×BASE, … capped at CAP.
+        """
+        if not success and error_msg and ZERO_API_CALLS_MARKER in error_msg.lower():
+            if self._rate_limit_backoff_seconds <= 0:
+                self._rate_limit_backoff_seconds = RATE_LIMIT_BACKOFF_BASE_SECONDS
+            else:
+                self._rate_limit_backoff_seconds = min(
+                    self._rate_limit_backoff_seconds * 2.0,
+                    RATE_LIMIT_BACKOFF_CAP_SECONDS,
+                )
+        else:
+            self._rate_limit_backoff_seconds = 0.0
+
+    @staticmethod
+    def _resolve_session_agent(adapter, session_key: str):
+        """Return the cached ``AIAgent`` for ``session_key``, or ``None``.
+
+        The agent lives in the GatewayRunner's ``_agent_cache`` (an
+        OrderedDict mapping session_key → ``(agent, config_sig)``). We reach
+        the runner via the bound message handler the runner registered on the
+        adapter (``adapter.set_message_handler(self._handle_message)`` →
+        ``adapter._message_handler.__self__`` is the runner). Every hop is
+        getattr-guarded; ANY missing link returns ``None`` (caller treats a
+        ``None`` agent as "can't tell" and fails safe to success, never to a
+        false release).
+
+        Read under ``_agent_cache_lock`` and mirror run.py's own tuple-unwrap
+        idiom (``_cached[0] if isinstance(_cached, tuple) else ...``).
+        """
+        handler = getattr(adapter, "_message_handler", None)
+        runner = getattr(handler, "__self__", None)
+        if runner is None:
+            return None
+        cache = getattr(runner, "_agent_cache", None)
+        if cache is None:
+            return None
+        lock = getattr(runner, "_agent_cache_lock", None)
+        try:
+            if lock is not None:
+                with lock:
+                    cached = cache.get(session_key)
+            else:
+                cached = cache.get(session_key)
+        except Exception:
+            return None
+        if not cached:
+            return None
+        if isinstance(cached, tuple):
+            return cached[0] if cached else None
+        return cached
+
+    @staticmethod
+    def _run_made_successful_calls(pre_agent, pre_calls, post_agent, post_calls):
+        """Tri-state: did the just-finished run make ≥1 *successful* API call?
+
+        Returns:
+          * ``True``  — confident the run made progress (positive delta, or
+            counters unreadable in a way that should NOT trigger a release).
+          * ``False`` — CONFIDENT zero: the SAME agent object spanned the run
+            and its ``session_api_calls`` did not advance, OR a fresh agent
+            ended the run at exactly zero. This is the ONLY path that releases
+            the row, so it must never fire on ambiguity.
+          * ``None``  — can't tell (agent object swapped mid-run, or a counter
+            was unreadable). Caller fails safe to success.
+
+        Signal rationale (BIZ-352): ``session_api_calls`` increments ONLY after
+        a successful provider response (run_agent.py:11210), so a first-call
+        429 leaves it at 0. (We deliberately do NOT use ``_api_call_count`` —
+        that is bumped at the loop TOP, *before* the call, so a 429 leaves it
+        at 1 and would mask the bug.)
+        """
+        # Same agent spanned the whole run → trust the delta.
+        if (
+            pre_agent is not None
+            and post_agent is not None
+            and pre_agent is post_agent
+            and isinstance(pre_calls, int)
+            and isinstance(post_calls, int)
+        ):
+            return (post_calls - pre_calls) > 0
+
+        # Cold start: the agent wasn't cached when we snapshotted (pre_agent
+        # is None) but exists afterward. The post agent is fresh for this
+        # session, so its counter reflects THIS run in full — a readable 0 is
+        # a confident zero. (A mid-run swap to a *different* real agent is NOT
+        # handled here: pre_agent being a distinct live object means the
+        # pre-swap agent may have made calls we can't see, so we fall through
+        # to None and fail safe to success.)
+        if pre_agent is None and post_agent is not None and isinstance(post_calls, int):
+            return post_calls > 0
+
+        # Anything else — unreadable counters, missing post agent, or a mid-run
+        # agent swap — is ambiguous. Fail safe to success (never a false release).
+        return None
 
     async def _writeback_completion(
         self,
@@ -703,6 +862,13 @@ class HermesJobsWorker:
             self.callsign, row.get("issue_key", "?"), session_key,
         )
 
+        # BIZ-352: snapshot the session's successful-API-call counter BEFORE
+        # the run so we can detect a 429 / auth no-op (zero successful calls)
+        # afterward. Best-effort: if the agent isn't cached yet (cold start)
+        # both snapshots are None and we fail safe to success.
+        pre_agent = self._resolve_session_agent(adapter, session_key)
+        pre_calls = getattr(pre_agent, "session_api_calls", None)
+
         try:
             await adapter._process_message_background(event, session_key)
             # 2026-05-19 fix — _process_message_background returns cleanly even
@@ -728,6 +894,28 @@ class HermesJobsWorker:
                     self.callsign, row.get("issue_key", "?"),
                 )
                 return False, "session interrupted: invalidate_generation fired mid-run, agent result was discarded as stale before reaching Telegram"
+
+            # BIZ-352: detect a rate-limit / auth no-op. _process_message_background
+            # returns None whether the agent did real work OR bailed on a first-call
+            # 429 / auth-dead window, so the pre-fix `return True, None` recorded a
+            # fake completed_at with no artifact. Compare the session's successful-
+            # API-call counter before/after on the SAME agent object: a confident
+            # zero (delta == 0, or a fresh agent that ended at 0) means no model
+            # call ever succeeded — release the row for retry instead of completing
+            # it. Anything ambiguous (agent swapped, counters unreadable) fails safe
+            # to success so we NEVER release a row that actually produced output.
+            post_agent = self._resolve_session_agent(adapter, session_key)
+            post_calls = getattr(post_agent, "session_api_calls", None)
+            made_calls = self._run_made_successful_calls(
+                pre_agent, pre_calls, post_agent, post_calls,
+            )
+            if made_calls is False:
+                logger.warning(
+                    "HermesJobsWorker (%s) %s: run made zero successful API calls "
+                    "(pre=%r post=%r) — rate-limit/auth no-op, releasing row for retry",
+                    self.callsign, row.get("issue_key", "?"), pre_calls, post_calls,
+                )
+                return False, ZERO_API_CALLS_ERROR
             return True, None
         except Exception as e:
             logger.exception(

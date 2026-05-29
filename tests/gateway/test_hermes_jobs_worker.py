@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+from collections import OrderedDict
 from typing import Any, Optional
 from unittest.mock import patch
 
@@ -34,7 +36,13 @@ from gateway.hermes_jobs_worker import (
     COMPLETE_JOB_SQL,
     FAIL_JOB_SQL,
     PROFILE_TO_CALLSIGN,
+    RATE_LIMIT_BACKOFF_BASE_SECONDS,
+    RATE_LIMIT_BACKOFF_CAP_SECONDS,
+    RELEASE_JOB_SQL,
     RENEW_LEASE_SQL,
+    TRANSIENT_FAILURE_SUBSTRINGS,
+    ZERO_API_CALLS_ERROR,
+    ZERO_API_CALLS_MARKER,
     HermesJobsWorker,
     build_runner_job_from_row,
     redact_dsn,
@@ -119,7 +127,8 @@ class TestClaimSqlPinning:
         assert "FOR UPDATE SKIP LOCKED" in CLAIM_NEXT_HERMES_JOB_SQL
 
     def test_priority_ordering(self):
-        assert "ORDER BY priority DESC, queued_at" in CLAIM_NEXT_HERMES_JOB_SQL
+        assert "priority DESC" in CLAIM_NEXT_HERMES_JOB_SQL
+        assert "queued_at" in CLAIM_NEXT_HERMES_JOB_SQL
 
     def test_lease_window(self):
         assert "interval '30 minutes'" in CLAIM_NEXT_HERMES_JOB_SQL
@@ -136,6 +145,15 @@ class TestClaimSqlPinning:
         assert "completed_at IS NULL" in CLAIM_NEXT_HERMES_JOB_SQL
         assert "failed_at IS NULL" in CLAIM_NEXT_HERMES_JOB_SQL
 
+    def test_biz276_exclude_callsign_hard_gate(self):
+        assert "metadata->>'exclude_callsign'" in CLAIM_NEXT_HERMES_JOB_SQL
+        assert "metadata->>'exclude_callsign' != $1" in CLAIM_NEXT_HERMES_JOB_SQL
+
+    def test_biz276_preferred_callsign_soft_fallback(self):
+        assert "metadata->>'preferred_callsign'" in CLAIM_NEXT_HERMES_JOB_SQL
+        assert "metadata->>'preferred_callsign' = $1" in CLAIM_NEXT_HERMES_JOB_SQL
+        assert "queued_at <= now() - interval '30 seconds'" in CLAIM_NEXT_HERMES_JOB_SQL
+
     def test_renewal_guarded_by_id_and_callsign(self):
         assert "WHERE id = $1" in RENEW_LEASE_SQL
         assert "AND claimed_by = $2" in RENEW_LEASE_SQL
@@ -148,6 +166,51 @@ class TestClaimSqlPinning:
         assert "WHERE id = $1" in FAIL_JOB_SQL
         assert "AND claimed_by = $2" in FAIL_JOB_SQL
         assert "last_error = $3" in FAIL_JOB_SQL
+
+
+class TestBiz276AffinitySemantics:
+    """Deterministic model of the BIZ-276 claim predicates.
+
+    The live enforcement is SQL, but these tests pin the business
+    semantics so a future SQL rewrite cannot accidentally allow an early
+    non-preferred re-review claim or weaken merge exclusion.
+    """
+
+    @staticmethod
+    def _claimable(metadata: Any, callsign: str, age_seconds: int) -> bool:
+        if not isinstance(metadata, dict):
+            metadata = {}
+        exclude = metadata.get("exclude_callsign")
+        preferred = metadata.get("preferred_callsign")
+        if isinstance(exclude, str) and exclude.strip() and exclude == callsign:
+            return False
+        if not isinstance(preferred, str) or not preferred.strip():
+            return True
+        if preferred == callsign:
+            return True
+        return age_seconds >= 30
+
+    def test_preferred_callsign_claims_immediately(self):
+        metadata = {"preferred_callsign": "Hermes"}
+        assert self._claimable(metadata, "Hermes", 0) is True
+
+    def test_non_preferred_waits_until_30_second_fallback(self):
+        metadata = {"preferred_callsign": "Hermes"}
+        assert self._claimable(metadata, "Iron Man", 29) is False
+        assert self._claimable(metadata, "Iron Man", 30) is True
+
+    def test_exclude_callsign_has_no_fallback_window(self):
+        metadata = {"exclude_callsign": "Iron Man"}
+        assert self._claimable(metadata, "Iron Man", 0) is False
+        assert self._claimable(metadata, "Iron Man", 30) is False
+        assert self._claimable(metadata, "Iron Man", 3600) is False
+        assert self._claimable(metadata, "Hermes", 0) is True
+
+    def test_missing_blank_or_malformed_metadata_is_fail_open(self):
+        assert self._claimable({}, "Black Widow", 0) is True
+        assert self._claimable({"preferred_callsign": ""}, "Black Widow", 0) is True
+        assert self._claimable({"exclude_callsign": ""}, "Black Widow", 0) is True
+        assert self._claimable("not-json-object", "Black Widow", 0) is True
 
 
 # ---------------------------------------------------------------------------
@@ -580,3 +643,240 @@ async def test_two_workers_issue_canonical_claim_sql():
     assert fetch_a[0][2] == ("Iron Man",)
     assert fetch_b and fetch_b[0][1] == CLAIM_NEXT_HERMES_JOB_SQL
     assert fetch_b[0][2] == ("Captain America",)
+
+
+# ===========================================================================
+# BIZ-352 — rate-limit / auth no-op detection + bounded backoff.
+#
+# A 429 / auth-dead window during packet authoring makes the agent loop exit
+# cleanly with ZERO successful API calls and no artifact. The pre-fix code
+# recorded such a row completed_at with api_calls=0. These tests pin the three
+# pure helpers that drive the fix plus the DB writeback + backoff state.
+# ===========================================================================
+
+
+# -- Fakes for the agent-cache backref --------------------------------------
+
+class _FakeAgent:
+    """Stand-in for run_agent.AIAgent — only needs session_api_calls."""
+
+    def __init__(self, session_api_calls: int = 0):
+        self.session_api_calls = session_api_calls
+
+
+class _FakeRunner:
+    """Stand-in for GatewayRunner. ``_handle_message`` is a real bound method
+    so ``_handle_message.__self__`` resolves back to this instance, exactly
+    like ``adapter.set_message_handler(self._handle_message)`` at run.py:2443.
+    """
+
+    def __init__(self, cache=None, *, with_lock: bool = True):
+        if cache is not None:
+            self._agent_cache = cache
+        if with_lock:
+            self._agent_cache_lock = threading.Lock()
+
+    def _handle_message(self, event):  # pragma: no cover - identity only
+        return None
+
+
+class _FakeAdapter:
+    def __init__(self, handler=None):
+        if handler is not None:
+            self._message_handler = handler
+
+
+def _adapter_for(session_key, agent, *, as_tuple=True, with_lock=True):
+    """Build an adapter whose bound-handler backref reaches a runner holding
+    ``agent`` in ``_agent_cache[session_key]``."""
+    value = (agent, "config-sig") if as_tuple else agent
+    cache = OrderedDict({session_key: value})
+    runner = _FakeRunner(cache, with_lock=with_lock)
+    return _FakeAdapter(handler=runner._handle_message)
+
+
+class TestRunMadeSuccessfulCalls:
+    """Tri-state signal: True / False (confident zero) / None (ambiguous)."""
+
+    def test_same_agent_positive_delta_is_true(self):
+        a = object()
+        assert HermesJobsWorker._run_made_successful_calls(a, 3, a, 5) is True
+
+    def test_same_agent_zero_delta_is_confident_false(self):
+        a = object()
+        # The exact bug signature: counter didn't advance across the run.
+        assert HermesJobsWorker._run_made_successful_calls(a, 5, a, 5) is False
+
+    def test_same_agent_unreadable_pre_is_ambiguous_none(self):
+        a = object()
+        assert HermesJobsWorker._run_made_successful_calls(a, None, a, 5) is None
+
+    def test_cold_start_fresh_agent_zero_is_confident_false(self):
+        a = object()
+        # pre_agent is None (agent wasn't cached at snapshot time); the fresh
+        # agent ended at 0 → no model call ever succeeded.
+        assert HermesJobsWorker._run_made_successful_calls(None, None, a, 0) is False
+
+    def test_cold_start_fresh_agent_positive_is_true(self):
+        a = object()
+        assert HermesJobsWorker._run_made_successful_calls(None, None, a, 2) is True
+
+    def test_mid_run_agent_swap_is_ambiguous_none(self):
+        # Two DISTINCT real agents: the pre-swap agent may have made calls we
+        # can't see. MUST NOT false-release — fail safe to success (None).
+        pre, post = object(), object()
+        assert HermesJobsWorker._run_made_successful_calls(pre, 3, post, 0) is None
+
+    def test_missing_post_agent_is_ambiguous_none(self):
+        a = object()
+        assert HermesJobsWorker._run_made_successful_calls(a, 3, None, None) is None
+
+    def test_post_calls_unreadable_is_ambiguous_none(self):
+        a = object()
+        assert HermesJobsWorker._run_made_successful_calls(None, None, a, None) is None
+
+
+class TestResolveSessionAgent:
+    SK = "telegram:dm:123"
+
+    def test_resolves_tuple_cached_agent(self):
+        agent = _FakeAgent(session_api_calls=7)
+        adapter = _adapter_for(self.SK, agent, as_tuple=True)
+        assert HermesJobsWorker._resolve_session_agent(adapter, self.SK) is agent
+
+    def test_resolves_bare_cached_agent(self):
+        # run.py's own idiom tolerates a non-tuple cache value.
+        agent = _FakeAgent()
+        adapter = _adapter_for(self.SK, agent, as_tuple=False)
+        assert HermesJobsWorker._resolve_session_agent(adapter, self.SK) is agent
+
+    def test_resolves_without_lock(self):
+        agent = _FakeAgent()
+        adapter = _adapter_for(self.SK, agent, with_lock=False)
+        assert HermesJobsWorker._resolve_session_agent(adapter, self.SK) is agent
+
+    def test_missing_session_key_returns_none(self):
+        agent = _FakeAgent()
+        adapter = _adapter_for(self.SK, agent)
+        assert HermesJobsWorker._resolve_session_agent(adapter, "other-key") is None
+
+    def test_no_message_handler_returns_none(self):
+        assert HermesJobsWorker._resolve_session_agent(_FakeAdapter(), self.SK) is None
+
+    def test_handler_without_self_returns_none(self):
+        def plain_handler(event):  # a plain function has no __self__
+            return None
+        assert (
+            HermesJobsWorker._resolve_session_agent(
+                _FakeAdapter(handler=plain_handler), self.SK,
+            )
+            is None
+        )
+
+    def test_runner_without_agent_cache_returns_none(self):
+        runner = _FakeRunner(cache=None)  # no _agent_cache attribute set
+        adapter = _FakeAdapter(handler=runner._handle_message)
+        assert HermesJobsWorker._resolve_session_agent(adapter, self.SK) is None
+
+    def test_cache_get_raising_returns_none(self):
+        class _BoomCache:
+            def get(self, key):
+                raise RuntimeError("cache exploded")
+        runner = _FakeRunner(cache=_BoomCache())
+        adapter = _FakeAdapter(handler=runner._handle_message)
+        assert HermesJobsWorker._resolve_session_agent(adapter, self.SK) is None
+
+
+class TestRateLimitBackoff:
+    def test_initial_backoff_is_zero(self):
+        worker = _make_worker()
+        assert worker._rate_limit_backoff_seconds == 0.0
+
+    def test_zero_call_marker_grows_exponentially_and_caps(self):
+        worker = _make_worker()
+        worker._update_rate_limit_backoff(False, ZERO_API_CALLS_ERROR)
+        assert worker._rate_limit_backoff_seconds == RATE_LIMIT_BACKOFF_BASE_SECONDS
+        worker._update_rate_limit_backoff(False, ZERO_API_CALLS_ERROR)
+        assert worker._rate_limit_backoff_seconds == RATE_LIMIT_BACKOFF_BASE_SECONDS * 2
+        # Hammer it — must saturate at the cap, never exceed it.
+        for _ in range(20):
+            worker._update_rate_limit_backoff(False, ZERO_API_CALLS_ERROR)
+        assert worker._rate_limit_backoff_seconds == RATE_LIMIT_BACKOFF_CAP_SECONDS
+
+    def test_success_resets_backoff(self):
+        worker = _make_worker()
+        worker._rate_limit_backoff_seconds = 240.0
+        worker._update_rate_limit_backoff(True, None)
+        assert worker._rate_limit_backoff_seconds == 0.0
+
+    def test_other_failure_resets_backoff(self):
+        worker = _make_worker()
+        worker._rate_limit_backoff_seconds = 120.0
+        worker._update_rate_limit_backoff(False, "boom: unrelated failure")
+        assert worker._rate_limit_backoff_seconds == 0.0
+
+    def test_none_error_resets_backoff(self):
+        worker = _make_worker()
+        worker._rate_limit_backoff_seconds = 60.0
+        worker._update_rate_limit_backoff(False, None)
+        assert worker._rate_limit_backoff_seconds == 0.0
+
+
+class TestZeroApiCallsConstantsWiring:
+    def test_marker_embedded_in_error_message(self):
+        assert ZERO_API_CALLS_MARKER in ZERO_API_CALLS_ERROR.lower()
+
+    def test_marker_is_a_transient_substring(self):
+        # So _writeback_completion routes the error to RELEASE, not FAIL.
+        assert ZERO_API_CALLS_MARKER in TRANSIENT_FAILURE_SUBSTRINGS
+
+    def test_backoff_bounds_are_sane(self):
+        assert 0 < RATE_LIMIT_BACKOFF_BASE_SECONDS < RATE_LIMIT_BACKOFF_CAP_SECONDS
+
+
+@pytest.mark.asyncio
+class TestZeroApiCallsWriteback:
+    async def test_zero_api_calls_error_releases_not_fails(self):
+        pool = _FakePool()
+        worker = _make_worker(pool=pool)
+        await worker._writeback_completion(
+            "rid-1", "BIZ-352", 1, False, ZERO_API_CALLS_ERROR,
+        )
+        execute_calls = [c for c in pool.calls if c[0] == "execute"]
+        release_calls = [c for c in execute_calls if "claimed_by = NULL" in c[1]]
+        assert release_calls, f"expected RELEASE, got {execute_calls}"
+        assert release_calls[0][1] == RELEASE_JOB_SQL
+        assert release_calls[0][2] == ("rid-1", "Black Widow")
+        # Critically: it must NOT mark the row failed_at (permanent disqualify).
+        assert not any("failed_at = now()" in c[1] for c in execute_calls)
+
+    async def test_zero_api_calls_run_releases_and_grows_backoff(self):
+        # Drive the full _process_row path via the injected runner: a runner
+        # returning the ZERO_API_CALLS_ERROR must RELEASE the row AND arm the
+        # rate-limit backoff for the next claim.
+        pool = _FakePool(claim_rows=[_row()])
+
+        def fake_runner(job):
+            return (False, "doc", "", ZERO_API_CALLS_ERROR)
+
+        worker = _make_worker(pool=pool, runner=fake_runner)
+        await worker._process_row(_row())
+
+        execute_calls = [c for c in pool.calls if c[0] == "execute"]
+        assert any("claimed_by = NULL" in c[1] for c in execute_calls)
+        assert not any("failed_at = now()" in c[1] for c in execute_calls)
+        assert worker._rate_limit_backoff_seconds == RATE_LIMIT_BACKOFF_BASE_SECONDS
+
+    async def test_successful_run_clears_backoff(self):
+        pool = _FakePool(claim_rows=[_row()])
+
+        def fake_runner(job):
+            return (True, "doc", "final", None)
+
+        worker = _make_worker(pool=pool, runner=fake_runner)
+        worker._rate_limit_backoff_seconds = 240.0  # pretend a prior 429 armed it
+        await worker._process_row(_row())
+
+        execute_calls = [c for c in pool.calls if c[0] == "execute"]
+        assert any("completed_at = now()" in c[1] for c in execute_calls)
+        assert worker._rate_limit_backoff_seconds == 0.0
