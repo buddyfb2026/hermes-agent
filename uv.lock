@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-08-04T07:06:16.774262776Z"
+exclude-newer = "2026-08-05T15:55:27.479962Z"
 exclude-newer-span = "P14D"
 
 [options.exclude-newer-package]
@@ -1572,6 +1572,7 @@ name = "hermes-agent"
 version = "0.20.4"
 source = { editable = "." }
 dependencies = [
+    { name = "asyncpg" },
     { name = "certifi" },
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'" },
     { name = "croniter" },
@@ -1822,6 +1823,7 @@ requires-dist = [
     { name = "aiosqlite", marker = "extra == 'matrix'", specifier = "==0.22.1" },
     { name = "alibabacloud-dingtalk", marker = "extra == 'dingtalk'", specifier = "==2.2.42" },
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = "==0.87.0" },
+    { name = "asyncpg", specifier = ">=0.29" },
     { name = "asyncpg", marker = "extra == 'matrix'", specifier = "==0.31.0" },
     { name = "azure-identity", marker = "extra == 'azure-identity'", specifier = "==1.25.3" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = "==1.42.89" },
