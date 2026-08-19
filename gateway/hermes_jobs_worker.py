@@ -41,6 +41,8 @@ import logging
 import os
 import random
 import re
+import time
+from pathlib import Path
 from typing import Mapping, Optional
 
 logger = logging.getLogger(__name__)
@@ -208,6 +210,88 @@ PROFILE_TO_CALLSIGN: Mapping[str, str] = {
     "hermes5": "Spiderman",
 }
 
+DEFAULT_ISSUE_ROOM_ROOT = Path.home() / ".hermes" / "issue-rooms" / "active"
+
+
+def profile_for_callsign(callsign: str) -> Optional[str]:
+    """Return the canonical local profile for an Avenger callsign."""
+    for profile, mapped in PROFILE_TO_CALLSIGN.items():
+        if mapped == callsign and profile != "hermes":
+            return profile
+    return None
+
+
+def _issue_room_path(root: Path, issue_key: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "-", str(issue_key or "unknown")).strip("-")
+    return root / f"{safe or 'unknown'}.json"
+
+
+def write_issue_room_state(
+    root: Path,
+    row: Mapping,
+    *,
+    profile_name: str,
+    callsign: str,
+    status: str,
+    session_key: str = "",
+    session_id: str = "",
+    baseline_message_count: int = 0,
+    error: str = "",
+) -> Path:
+    """Atomically publish one issue's authoring-room state for Desktop.
+
+    Only routing/lifecycle metadata is copied. The transcript remains
+    authoritative in the profile SessionDB and is read through the read-only
+    ``session.messages`` RPC. Existing members are unioned so a retry claimed
+    by another Avenger never erases the first participant.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    issue_key = str(row.get("issue_key") or "?")
+    path = _issue_room_path(root, issue_key)
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+
+    now = time.time()
+    members = [m for m in existing.get("members", []) if isinstance(m, dict)]
+    if not any(m.get("profile") == profile_name for m in members):
+        members.append({"profile": profile_name, "callsign": callsign, "joined_at": now})
+
+    previous = existing.get("authoring")
+    if not isinstance(previous, dict) or str(existing.get("job_id") or "") != str(row.get("id") or ""):
+        previous = {}
+    record = {
+        "schema": 1,
+        "issue_key": issue_key,
+        "issue_id": str(row.get("issue_id") or existing.get("issue_id") or ""),
+        "job_id": str(row.get("id") or ""),
+        "room_state": "active",
+        "members": members,
+        "authoring": {
+            "profile": profile_name,
+            "callsign": callsign,
+            "status": status,
+            "session_key": session_key or previous.get("session_key") or "",
+            "session_id": session_id or previous.get("session_id") or "",
+            "baseline_message_count": int(
+                baseline_message_count
+                if session_key or session_id
+                else previous.get("baseline_message_count") or 0
+            ),
+            "started_at": previous.get("started_at") or now,
+            "updated_at": now,
+            "error": str(error or "")[:1000],
+        },
+        "updated_at": now,
+    }
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{profile_name}.tmp")
+    tmp.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
 
 def resolve_callsign(
     profile_name: Optional[str],
@@ -321,6 +405,8 @@ class HermesJobsWorker:
         *,
         callsign: str,
         dsn: str,
+        profile_name: Optional[str] = None,
+        issue_room_root: Optional[Path] = None,
         adapters: Optional[dict] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
         poll_interval_seconds: float = 3.0,
@@ -329,6 +415,8 @@ class HermesJobsWorker:
         runner=None,
     ):
         self.callsign = callsign
+        self.profile_name = profile_name or profile_for_callsign(callsign) or "default"
+        self.issue_room_root = Path(issue_room_root) if issue_room_root is not None else None
         self.dsn = dsn
         self.adapters = adapters or {}
         self.loop = loop
@@ -392,6 +480,8 @@ class HermesJobsWorker:
 
         return cls(
             callsign=callsign,
+            profile_name=profile_name,
+            issue_room_root=DEFAULT_ISSUE_ROOM_ROOT,
             dsn=dsn,
             adapters=adapters,
             loop=loop,
@@ -552,6 +642,66 @@ class HermesJobsWorker:
         except asyncio.CancelledError:
             return
 
+    def _publish_issue_room(self, row: Mapping, *, status: str, **kwargs) -> None:
+        if self.issue_room_root is None:
+            return
+        try:
+            write_issue_room_state(
+                self.issue_room_root,
+                row,
+                profile_name=self.profile_name,
+                callsign=self.callsign,
+                status=status,
+                **kwargs,
+            )
+        except Exception:
+            # Observability must never burn or interrupt a real queue job.
+            logger.exception(
+                "HermesJobsWorker (%s) could not publish issue-room state for %s",
+                self.callsign,
+                row.get("issue_key", "?"),
+            )
+
+    @staticmethod
+    def _session_transcript_snapshot(adapter, session_key: str) -> tuple[str, int]:
+        """Read the durable session id + message baseline without mutating it."""
+        store = getattr(adapter, "_session_store", None)
+        if store is None:
+            return "", 0
+        try:
+            peek = getattr(store, "peek_session_id", None)
+            session_id = str(peek(session_key) or "") if callable(peek) else ""
+            load = getattr(store, "load_transcript", None)
+            transcript = load(session_id or session_key) if callable(load) else []
+            return session_id, len(transcript) if isinstance(transcript, (list, tuple)) else 0
+        except Exception:
+            return "", 0
+
+    async def _publish_session_id_when_ready(
+        self,
+        row: Mapping,
+        adapter,
+        session_key: str,
+        baseline_message_count: int,
+    ) -> None:
+        """Publish a freshly-created session id while authoring is still live."""
+        last_session_id = ""
+        try:
+            while True:
+                session_id, _ = self._session_transcript_snapshot(adapter, session_key)
+                if session_id and session_id != last_session_id:
+                    last_session_id = session_id
+                    self._publish_issue_room(
+                        row,
+                        status="authoring",
+                        session_key=session_key,
+                        session_id=session_id,
+                        baseline_message_count=baseline_message_count,
+                    )
+                await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            return
+
     async def _process_row(self, row: dict) -> None:
         row_id = row["id"]
         issue_key = row.get("issue_key", "?")
@@ -566,6 +716,7 @@ class HermesJobsWorker:
         ) or 1
 
         logger.info("🦸 %s claimed %s v%s", self.callsign, issue_key, packet_version)
+        self._publish_issue_room(row, status="claimed")
 
         renewal_task = asyncio.create_task(
             self._renew_lease_loop(row_id),
@@ -595,6 +746,12 @@ class HermesJobsWorker:
         await self._writeback_completion(
             row_id, issue_key, packet_version, success, error_msg,
         )
+        err_lower = (error_msg or "").lower()
+        transient = (not success) and any(
+            marker in err_lower for marker in TRANSIENT_FAILURE_SUBSTRINGS
+        )
+        room_status = "packet_ready" if success else ("released" if transient else "authoring_failed")
+        self._publish_issue_room(row, status=room_status, error=error_msg or "")
 
         # BIZ-352: grow/reset the rate-limit backoff based on this run's
         # outcome. Done after writeback so the row state is already settled.
@@ -862,6 +1019,21 @@ class HermesJobsWorker:
             self.callsign, row.get("issue_key", "?"), session_key,
         )
 
+        session_id, baseline_message_count = self._session_transcript_snapshot(adapter, session_key)
+        self._publish_issue_room(
+            row,
+            status="authoring",
+            session_key=session_key,
+            session_id=session_id,
+            baseline_message_count=baseline_message_count,
+        )
+        session_id_task = asyncio.create_task(
+            self._publish_session_id_when_ready(
+                row, adapter, session_key, baseline_message_count,
+            ),
+            name=f"hermes-issue-room-session-{row_id_str}",
+        )
+
         # BIZ-352: snapshot the session's successful-API-call counter BEFORE
         # the run so we can detect a 429 / auth no-op (zero successful calls)
         # afterward. Best-effort: if the agent isn't cached yet (cold start)
@@ -923,3 +1095,18 @@ class HermesJobsWorker:
                 self.callsign, row_id_str, e,
             )
             return False, f"{type(e).__name__}: {e}"
+        finally:
+            final_session_id, _ = self._session_transcript_snapshot(adapter, session_key)
+            if final_session_id:
+                self._publish_issue_room(
+                    row,
+                    status="authoring",
+                    session_key=session_key,
+                    session_id=final_session_id,
+                    baseline_message_count=baseline_message_count,
+                )
+            session_id_task.cancel()
+            try:
+                await session_id_task
+            except (asyncio.CancelledError, Exception):
+                pass

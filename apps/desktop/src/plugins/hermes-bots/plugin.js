@@ -243,6 +243,7 @@ async function refreshStudioFleetCody() {
 
 function startStudioFleetCodyObserver(ctx) {
   void refreshStudioFleetCody()
+  if (typeof setInterval !== 'function') return
   const timer = setInterval(() => void refreshStudioFleetCody(), STUDIO_FLEET_POLL_MS)
   if (typeof ctx.onDispose === 'function') ctx.onDispose(() => clearInterval(timer))
 }
@@ -4036,6 +4037,7 @@ function updateGroupChat(group, mutate) {
         // Source-qualified member descriptors keep the room whole when the
         // active connection changes and today's local members become remote.
         members: Array.isArray(room.members) ? room.members : [],
+        automation: room.automation && typeof room.automation === 'object' ? room.automation : null,
         // Room picture (small data URL, same normalization as bot avatars).
         image: room.image || null
       }
@@ -4094,6 +4096,7 @@ async function disbandGroupChat(group, members) {
           watermarks: room.watermarks,
           sessions: room.sessions || {},
           members: Array.isArray(room.members) ? room.members : [],
+          automation: room.automation && typeof room.automation === 'object' ? room.automation : null,
           image: room.image || null
         }
       }
@@ -4227,6 +4230,192 @@ function appendGroupChatEntry(group, from, text, thread, images) {
   }
 
   return entry
+}
+
+// ── Linear issue rooms: observe real Avengers packet authoring ───────────────
+
+const LINEAR_ISSUE_ROOM_ROOT = '/Users/buddystudio1/.hermes/issue-rooms/active'
+const LINEAR_ISSUE_ROOM_POLL_MS = 1500
+let linearIssueRoomRefreshRunning = false
+
+function issueRoomContentText(content) {
+  if (typeof content === 'string') return content.trim()
+  if (!Array.isArray(content)) return ''
+  return content
+    .map(part => (typeof part === 'string' ? part : (part?.text || part?.content || '')))
+    .filter(Boolean)
+    .join('\n')
+    .trim()
+}
+
+function issueRoomMessageText(message) {
+  const role = String(message?.role || '')
+  const content = issueRoomContentText(message?.content ?? message?.text)
+  if (role === 'user') return '' // baseline + skip: never mirror the synthetic/private prompt
+  if (role === 'tool') {
+    const name = String(message?.name || message?.tool_name || 'tool')
+    return `↳ ${name}${content ? `\n${content}` : ''}`.slice(0, 1800)
+  }
+  const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : []
+  const names = calls.map(call => call?.function?.name || call?.name).filter(Boolean)
+  const toolLine = names.length ? `🛠 ${names.join(', ')}` : ''
+  return [toolLine, content].filter(Boolean).join('\n').slice(0, 1800)
+}
+
+function issueRoomMember(profile, callsign) {
+  return {
+    name: String(profile || 'default'),
+    title: String(callsign || profile || 'Hermes'),
+    handle: String(profile || 'default'),
+    remoteSource: false,
+    sourceScoped: false
+  }
+}
+
+function issueRoomStatusText(status, callsign) {
+  if (status === 'claimed') return `🟢 ${callsign} claimed packet authoring.`
+  if (status === 'authoring') return `✍️ ${callsign} is authoring the task packet.`
+  if (status === 'packet_ready') return `✅ ${callsign} completed packet authoring.`
+  if (status === 'released') return `↪️ ${callsign} released the authoring claim for retry.`
+  if (status === 'authoring_failed') return `❌ ${callsign} hit an authoring failure.`
+  return ''
+}
+
+async function syncLinearIssueRoom(record) {
+  const issueKey = String(record?.issue_key || '').trim().toUpperCase()
+  const jobId = String(record?.job_id || '')
+  const authoring = record?.authoring || {}
+  if (!/^[A-Z]+-\d+$/.test(issueKey) || !jobId) return
+
+  const profile = String(authoring.profile || record?.members?.[0]?.profile || 'default')
+  const callsign = String(authoring.callsign || record?.members?.[0]?.callsign || profile)
+  const member = issueRoomMember(profile, callsign)
+  const baseline = Math.max(0, Number(authoring.baseline_message_count) || 0)
+  const existing = $groupChats.get()[issueKey] || {}
+  const priorAutomation = existing.automation || {}
+  const isNewJob = priorAutomation.job_id !== jobId
+  const cursor = isNewJob ? baseline : Math.max(baseline, Number(priorAutomation.cursor) || baseline)
+
+  const desiredMembers = (record.members || []).map(joined => issueRoomMember(joined.profile, joined.callsign))
+  if (!desiredMembers.some(candidate => candidate.name === member.name)) desiredMembers.push(member)
+  const currentMembers = Array.isArray(existing.members) ? existing.members : []
+  const sessionId = String(authoring.session_id || '')
+  const needsRoomUpdate = isNewJob
+    || desiredMembers.some(desired => !currentMembers.some(current => current.name === desired.name))
+    || String(priorAutomation.session_id || '') !== sessionId
+    || Number(priorAutomation.baseline) !== baseline
+
+  if (needsRoomUpdate) {
+    updateGroupChat(issueKey, room => {
+      const members = Array.isArray(room.members) ? [...room.members] : []
+      for (const descriptor of desiredMembers) {
+        if (!members.some(candidate => candidate.name === descriptor.name)) members.push(descriptor)
+      }
+      room.members = members
+      room.automation = {
+        kind: 'linear-issue',
+        issue_id: String(record.issue_id || ''),
+        job_id: jobId,
+        profile,
+        session_id: sessionId,
+        baseline,
+        cursor,
+        status: isNewJob ? '' : String(priorAutomation.status || '')
+      }
+      if (isNewJob) {
+        room.log.push({
+          at: Date.now(),
+          from: { kind: 'member', name: profile },
+          text: `🟢 ${callsign} claimed packet authoring.`,
+          thread: `issue:${jobId}`
+        })
+      }
+      return room
+    })
+  }
+
+  let nextOffset = cursor
+  if (sessionId) {
+    try {
+      const page = await requestForBot(member, 'session.messages', {
+        session_id: sessionId,
+        profile,
+        offset: cursor,
+        limit: 200
+      })
+      const messages = Array.isArray(page?.messages) ? page.messages : []
+      nextOffset = Math.max(cursor, Number(page?.next_offset) || cursor + messages.length)
+      if (messages.length || nextOffset > cursor) {
+        updateGroupChat(issueKey, room => {
+          for (const message of messages) {
+            const text = issueRoomMessageText(message)
+            if (text) {
+              room.log.push({
+                at: Date.now(),
+                from: { kind: 'member', name: profile },
+                text,
+                thread: `issue:${jobId}`
+              })
+            }
+          }
+          room.automation = { ...(room.automation || {}), cursor: nextOffset, session_id: sessionId }
+          return room
+        })
+      }
+    } catch {
+      // The worker can publish before SessionDB finishes its first row. Retry next poll.
+    }
+  }
+
+  const status = String(authoring.status || '')
+  const after = $groupChats.get()[issueKey] || {}
+  if (status && after.automation?.status !== status) {
+    const text = issueRoomStatusText(status, callsign)
+    updateGroupChat(issueKey, room => {
+      if (text && !(isNewJob && status === 'claimed')) {
+        room.log.push({
+          at: Date.now(),
+          from: { kind: 'member', name: profile },
+          text,
+          thread: `issue:${jobId}`
+        })
+      }
+      room.automation = { ...(room.automation || {}), status, cursor: nextOffset }
+      return room
+    })
+  }
+}
+
+async function refreshLinearIssueRooms() {
+  if (linearIssueRoomRefreshRunning) return
+  linearIssueRoomRefreshRunning = true
+  try {
+    const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
+    if (!desktop?.readDir || !desktop?.readFileText) return
+    let entries = []
+    try {
+      entries = (await desktop.readDir(LINEAR_ISSUE_ROOM_ROOT))?.entries || []
+    } catch {
+      return // no issue has been claimed yet
+    }
+    for (const entry of entries.filter(item => !item.isDirectory && item.name.endsWith('.json'))) {
+      try {
+        const raw = await desktop.readFileText(entry.path || `${LINEAR_ISSUE_ROOM_ROOT}/${entry.name}`)
+        await syncLinearIssueRoom(JSON.parse(raw?.text || '{}'))
+      } catch {
+        // Atomic writer replacement can race one poll; next tick reconciles.
+      }
+    }
+  } finally {
+    linearIssueRoomRefreshRunning = false
+  }
+}
+
+function startLinearIssueRoomObserver(ctx) {
+  void refreshLinearIssueRooms()
+  if (typeof setInterval !== 'function') return
+  const timer = setInterval(() => void refreshLinearIssueRooms(), LINEAR_ISSUE_ROOM_POLL_MS)
+  if (typeof ctx.onDispose === 'function') ctx.onDispose(() => clearInterval(timer))
 }
 
 /** Ensure the member's per-group session exists and return a LIVE runtime
@@ -10219,6 +10408,7 @@ export default {
     pluginCtx = ctx
     startFaceClock()
     startStudioFleetCodyObserver(ctx)
+    startLinearIssueRoomObserver(ctx)
     // Disabling the plugin (or a hot reload) must actually stop the clock —
     // before this, the rAF loop + 1Hz document scan ran until app restart.
     if (typeof ctx.onDispose === 'function') {
@@ -10341,6 +10531,7 @@ export default {
                   sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
                   stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
                   members: Array.isArray(room.members) ? room.members : [],
+                  automation: room.automation && typeof room.automation === 'object' ? room.automation : null,
                   image: typeof room.image === 'string' && room.image ? room.image : null,
                   epoch: 0,
                   running: false

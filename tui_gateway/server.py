@@ -317,6 +317,7 @@ _LONG_HANDLERS = frozenset(
         "session.branch",
         "session.compress",
         "session.list",
+        "session.messages",
         "session.resume",
         # Workspace re-home runs git branch/root subprocess probes against an
         # arbitrary folder — inline they'd stall the reader on a slow mount.

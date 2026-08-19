@@ -69,3 +69,25 @@ def test_session_list_include_hidden(db):
 
     all_rows = _call("session.list", {"include_hidden": True})["result"]["sessions"]
     assert {s["id"] for s in all_rows} == {"plain-chat", "bot-chat"}
+
+
+def test_session_messages_is_read_only_and_offset_bounded(db):
+    db.create_session("authoring-chat", source="telegram")
+    db.append_message("authoring-chat", role="user", content="private old prompt")
+    db.append_message("authoring-chat", role="assistant", content="old answer")
+    db.append_message("authoring-chat", role="assistant", content="new authoring output")
+    before = db.get_session("authoring-chat").copy()
+
+    envelope = _call(
+        "session.messages",
+        {"session_id": "authoring-chat", "offset": 2, "limit": 20},
+    )
+    assert "error" not in envelope, envelope
+    result = envelope["result"]
+    assert result["offset"] == 2
+    assert result["next_offset"] == 3
+    assert result["total"] == 3
+    assert [message["text"] for message in result["messages"]] == [
+        "new authoring output"
+    ]
+    assert db.get_session("authoring-chat") == before

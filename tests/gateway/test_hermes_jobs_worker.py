@@ -23,6 +23,7 @@ The full live-DB integration smoke runs in ``scripts/biz208_live_smoke.sh``
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 from collections import OrderedDict
@@ -47,6 +48,7 @@ from gateway.hermes_jobs_worker import (
     build_runner_job_from_row,
     redact_dsn,
     resolve_callsign,
+    write_issue_room_state,
 )
 
 
@@ -341,13 +343,15 @@ def _make_worker(
     callsign: str = "Black Widow",
     pool: Optional[_FakePool] = None,
     runner=None,
+    issue_room_root=None,
     poll_interval_seconds: float = 0.01,
     poll_jitter_seconds: float = 0.0,
     lease_renewal_interval_seconds: float = 0.05,
 ):
     worker = HermesJobsWorker(
         callsign=callsign,
-        dsn="postgresql://x:y@localhost/test",
+        dsn="postgresql://x:***@localhost/test",
+        issue_room_root=issue_room_root,
         adapters={},
         loop=None,
         poll_interval_seconds=poll_interval_seconds,
@@ -371,6 +375,83 @@ def _row(claim_id="rid-1", issue_key="BIZ-208", packet_version=2):
         "payload": {"packet_message": "do the thing", "packet_version": packet_version},
         "metadata": {},
     }
+
+
+# ---------------------------------------------------------------------------
+# Observable Linear issue-room bridge
+# ---------------------------------------------------------------------------
+
+
+def test_issue_room_state_is_atomic_privacy_bounded_and_preserves_members(tmp_path):
+    first = _row(claim_id="job-1", issue_key="BIZ-9999")
+    path = write_issue_room_state(
+        tmp_path,
+        first,
+        profile_name="hermes3",
+        callsign="Captain America",
+        status="authoring",
+        session_key="telegram-key",
+        session_id="session-1",
+        baseline_message_count=12,
+    )
+    state = json.loads(path.read_text())
+    assert state["issue_key"] == "BIZ-9999"
+    assert state["members"] == [
+        {
+            "profile": "hermes3",
+            "callsign": "Captain America",
+            "joined_at": state["members"][0]["joined_at"],
+        }
+    ]
+    assert state["authoring"]["baseline_message_count"] == 12
+    assert "prompt" not in json.dumps(state).lower()
+
+    retry = _row(claim_id="job-2", issue_key="BIZ-9999")
+    write_issue_room_state(
+        tmp_path,
+        retry,
+        profile_name="hermes4",
+        callsign="Black Widow",
+        status="claimed",
+    )
+    updated = json.loads(path.read_text())
+    assert [member["profile"] for member in updated["members"]] == ["hermes3", "hermes4"]
+    assert updated["job_id"] == "job-2"
+    assert updated["authoring"]["session_id"] == ""
+    assert updated["authoring"]["baseline_message_count"] == 0
+
+
+def test_session_snapshot_reads_id_and_baseline_without_mutation():
+    class Store:
+        def peek_session_id(self, key):
+            assert key == "telegram-key"
+            return "session-1"
+
+        def load_transcript(self, session_id):
+            assert session_id == "session-1"
+            return [{"role": "user"}, {"role": "assistant"}]
+
+    adapter = type("Adapter", (), {"_session_store": Store()})()
+    assert HermesJobsWorker._session_transcript_snapshot(adapter, "telegram-key") == (
+        "session-1",
+        2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_row_publishes_claim_and_terminal_status(tmp_path):
+    pool = _FakePool(claim_rows=[_row()])
+
+    def fake_runner(_job):
+        return (True, "doc", "final response", None)
+
+    worker = _make_worker(pool=pool, runner=fake_runner, issue_room_root=tmp_path)
+    await worker._process_row(_row())
+    state = json.loads((tmp_path / "BIZ-208.json").read_text())
+    assert state["members"][0]["callsign"] == "Black Widow"
+    assert state["authoring"]["status"] == "packet_ready"
+    # Packet completion does not close the issue room; Linear Done owns closure later.
+    assert state["room_state"] == "active"
 
 
 # ---------------------------------------------------------------------------
