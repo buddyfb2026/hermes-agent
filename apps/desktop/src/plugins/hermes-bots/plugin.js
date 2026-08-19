@@ -320,6 +320,12 @@ const $lastJobs = atom([])
  *  (the bot you're actually chatting with) and roster clicks. */
 const $selectedBot = atom('default')
 
+/** Owner of a plugin-rendered center workspace. Unlike a stored chat, a
+ * workspace has no focusedSessionProfile stamp, so it must explicitly publish
+ * which Bot owns the center view. This keeps roster highlight + Routines pane
+ * aligned with the content actually on screen. */
+const $botWorkspaceProfile = atom(null)
+
 /** Owner profile of the chat the user is LOOKING AT. Newer desktops expose
  *  `host.state.focusedSessionProfile` (the focused session row's stamped
  *  owner, gateway profile for drafts); older builds fall back to the gateway
@@ -4982,6 +4988,9 @@ function StudioFleetCodyMainView() {
 function closeStudioFleetCodyWorkspace() {
   const close = studioFleetCodyWorkspaceClose
   studioFleetCodyWorkspaceClose = null
+  if ($botWorkspaceProfile.get() === 'cody') {
+    $botWorkspaceProfile.set(null)
+  }
   try {
     close?.()
   } catch {
@@ -4990,15 +4999,24 @@ function closeStudioFleetCodyWorkspace() {
 }
 
 function openStudioFleetCodyWorkspace() {
-  if (studioFleetCodyWorkspaceClose || typeof host.openWorkspace !== 'function') return Boolean(studioFleetCodyWorkspaceClose)
+  if (studioFleetCodyWorkspaceClose || typeof host.openWorkspace !== 'function') {
+    if (studioFleetCodyWorkspaceClose) $botWorkspaceProfile.set('cody')
+    return Boolean(studioFleetCodyWorkspaceClose)
+  }
   studioFleetCodyWorkspaceClose = host.openWorkspace(`${ID}:studio-fleet-cody`, {
     title: 'Cody · Studio Fleet',
     minWidth: '24rem',
     render: () => jsx(StudioFleetCodyMainView, {}),
     onClose: () => {
       studioFleetCodyWorkspaceClose = null
+      if ($botWorkspaceProfile.get() === 'cody') {
+        $botWorkspaceProfile.set(null)
+      }
     }
   })
+  if (studioFleetCodyWorkspaceClose) {
+    $botWorkspaceProfile.set('cody')
+  }
   return true
 }
 
@@ -5007,6 +5025,7 @@ function openStudioFleetCodyWorkspace() {
 function BotRow({ bot, onDelete, onEdit, onGroup }) {
   const activeProfile = useValue(host.state.profile)
   const focusedProfile = useValue($focusedBotProfile)
+  const workspaceProfile = useValue($botWorkspaceProfile)
   const activeGroup = useValue($groupChatWorkspace)
   const meta = botRosterMeta(bot, useValue($botMeta))
   const groups = botGroups(meta)
@@ -5014,9 +5033,12 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   // Highlight follows the chat on screen (focused session's owner), not the
   // gateway socket's home — a focused tab doesn't swap the socket, and on the
   // old keying the wrong bot stayed highlighted while you read another's chat.
+  // A plugin workspace has no focused-session owner, so its explicit owner
+  // wins while it occupies the center; otherwise the focused chat owns it.
   // A selected group chat suppresses every bot-row highlight: the group row
   // owns the selection then (#88979).
-  const isActive = !activeGroup && !bot.remoteSource && bot.name === focusedProfile
+  const visibleProfile = workspaceProfile || focusedProfile
+  const isActive = !activeGroup && !bot.remoteSource && bot.name === visibleProfile
   // Turn-busy is a SOCKET fact: only the gateway-home profile can be mid-turn.
   const isGatewayHome = !bot.remoteSource && bot.name === activeProfile
   const { shape, color, image } = botAppearance(bot.name, meta)
@@ -7871,12 +7893,11 @@ function bindProfileSync(profileStore) {
 function RoutinesPane() {
   const selected = useValue($selectedBot)
   const focusedProfile = useValue($focusedBotProfile)
-  // The tile maps to the bot you're chatting with: the focused chat's owner
-  // profile is the truth once a chat opens (on older desktops without the
-  // focused-owner atom this is the live gateway profile, the previous
-  // behavior); $selectedBot covers the gap between a roster click and the
-  // focus/profile swap landing.
-  const bot = (focusedProfile || selected || 'default').trim() || 'default'
+  const workspaceProfile = useValue($botWorkspaceProfile)
+  // The tile maps to the Bot owning the center view. Explicit plugin-workspace
+  // ownership wins because these views have no focusedSessionProfile stamp;
+  // otherwise the focused chat's owner remains authoritative.
+  const bot = (workspaceProfile || focusedProfile || selected || 'default').trim() || 'default'
   const meta = useValue($botMeta)[bot]
   const { shape, color, image } = botAppearance(bot, meta)
   const { data, error, isLoading, refetch } = useRoutines(bot)

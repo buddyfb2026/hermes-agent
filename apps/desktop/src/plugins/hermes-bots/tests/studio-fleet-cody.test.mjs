@@ -88,5 +88,8 @@ test('overlay is scoped to the existing canonical cody profile only', () => {
   assert.match(source, /closeStudioFleetCodyWorkspace\(\)/)
   assert.match(source, /never persists across unrelated chats/)
   assert.match(source, /title: 'Cody · Studio Fleet'/)
+  assert.match(source, /\$botWorkspaceProfile\.set\('cody'\)/)
+  assert.match(source, /const visibleProfile = workspaceProfile \|\| focusedProfile/)
+  assert.match(source, /workspaceProfile \|\| focusedProfile \|\| selected/)
   assert.doesNotMatch(source, /append_message|prompt\.submit.*Studio Fleet/)
 })
