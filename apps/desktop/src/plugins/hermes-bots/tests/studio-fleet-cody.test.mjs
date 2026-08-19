@@ -83,6 +83,8 @@ test('overlay is scoped to the existing canonical cody profile only', () => {
   assert.match(source, /isStudioFleetCody && \['working', 'queued', 'unavailable'\]\.includes/)
   assert.match(source, /startStudioFleetCodyObserver\(ctx\)/)
   assert.match(source, /openStudioFleetCodyWorkspace\(\)/)
+  assert.match(source, /closeStudioFleetCodyWorkspace\(\)/)
+  assert.match(source, /never persists across unrelated chats/)
   assert.match(source, /title: 'Cody · Studio Fleet'/)
   assert.doesNotMatch(source, /append_message|prompt\.submit.*Studio Fleet/)
 })

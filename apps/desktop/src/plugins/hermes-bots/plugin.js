@@ -4948,6 +4948,16 @@ function StudioFleetCodyMainView() {
   })
 }
 
+function closeStudioFleetCodyWorkspace() {
+  const close = studioFleetCodyWorkspaceClose
+  studioFleetCodyWorkspaceClose = null
+  try {
+    close?.()
+  } catch {
+    /* workspace may already be gone */
+  }
+}
+
 function openStudioFleetCodyWorkspace() {
   if (studioFleetCodyWorkspaceClose || typeof host.openWorkspace !== 'function') return Boolean(studioFleetCodyWorkspaceClose)
   studioFleetCodyWorkspaceClose = host.openWorkspace(`${ID}:studio-fleet-cody`, {
@@ -5043,8 +5053,12 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
 
     // While the real Studio Fleet harness owns Cody's active task, selecting
     // the existing Cody row opens a read-only live work surface in the center.
-    // Idle clicks keep the normal canonical Bot Chat behavior.
-    if (isStudioFleetCody && ['working', 'queued'].includes(studioFleetCody.state) && openStudioFleetCodyWorkspace()) {
+    // Any other Bot selection (or Cody while idle) closes that surface, so it
+    // never persists across unrelated chats.
+    const codyWorkVisible = isStudioFleetCody && ['working', 'queued'].includes(studioFleetCody.state)
+    if (!codyWorkVisible) {
+      closeStudioFleetCodyWorkspace()
+    } else if (openStudioFleetCodyWorkspace()) {
       return
     }
 
