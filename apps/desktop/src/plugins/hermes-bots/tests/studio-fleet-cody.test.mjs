@@ -54,6 +54,8 @@ test('real Cody activity overlays the existing profile with issue and checklist 
     lines: ['• inspect files', '✓ migration complete', '→ running tests'],
     logPath: '/Users/buddystudio1/Projects/studio-fleet/cody/logs/build-map.codex.log',
     worktree: '/Users/buddystudio1/CodyWork/build-map',
+    logBytes: '• inspect files\n✓ migration complete\n→ running tests'.length,
+    lastOutputAt: api.$studioFleetCody.get().lastOutputAt,
     refreshedAt: api.$studioFleetCody.get().refreshedAt
   })
 })

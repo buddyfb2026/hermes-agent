@@ -125,6 +125,8 @@ const $studioFleetCody = atom({
   lines: [],
   logPath: '',
   worktree: '',
+  logBytes: 0,
+  lastOutputAt: 0,
   refreshedAt: 0
 })
 
@@ -155,18 +157,32 @@ function studioFleetFrontmatter(text) {
   return out
 }
 
-function studioFleetProgressLines(text) {
+function studioFleetChecklistLines(text) {
   const lines = String(text || '').split('\n').map(line => line.trim()).filter(Boolean)
-  const checklist = lines.filter(line => /^[✓→•]\s/.test(line))
-  const chosen = checklist.length ? checklist.slice(-14) : lines.slice(-18)
-  return chosen.map(line => (line.length > 240 ? `${line.slice(0, 239)}…` : line))
+  const unique = []
+  for (const line of lines.filter(line => /^[✓→•]\s/.test(line))) {
+    if (!unique.includes(line)) unique.push(line)
+  }
+  return unique.slice(-14)
+}
+
+function studioFleetTranscriptTail(text) {
+  return String(text || '')
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter(Boolean)
+    .slice(-24)
+    .map(line => (line.length > 260 ? `${line.slice(0, 259)}…` : line))
 }
 
 function studioFleetProgress(text) {
-  const lines = studioFleetProgressLines(text)
-  const raw = lines.at(-1) || ''
+  const checklist = studioFleetChecklistLines(text)
+  const raw = checklist.at(-1) || ''
   return raw.length > 72 ? `${raw.slice(0, 71)}…` : raw
 }
+
+let studioFleetLogSignature = ''
+let studioFleetLogChangedAt = 0
 
 async function refreshStudioFleetCody() {
   try {
@@ -182,6 +198,8 @@ async function refreshStudioFleetCody() {
         lines: [],
         logPath: '',
         worktree: '',
+        logBytes: 0,
+        lastOutputAt: 0,
         refreshedAt: Date.now()
       })
       return
@@ -196,7 +214,12 @@ async function refreshStudioFleetCody() {
       // Claim precedes log creation by a few seconds — still truthfully active.
     }
     const progress = studioFleetProgress(log)
-    const lines = studioFleetProgressLines(log)
+    const lines = studioFleetTranscriptTail(log)
+    const signature = `${log.length}:${log.slice(-256)}`
+    if (signature !== studioFleetLogSignature) {
+      studioFleetLogSignature = signature
+      studioFleetLogChangedAt = Date.now()
+    }
     const identity = meta.linear || task.id
     const title = meta.title || task.id
     $studioFleetCody.set({
@@ -208,6 +231,8 @@ async function refreshStudioFleetCody() {
       lines,
       logPath: `${STUDIO_FLEET_LOGS}/${task.id}.codex.log`,
       worktree: `/Users/buddystudio1/CodyWork/${task.id}`,
+      logBytes: log.length,
+      lastOutputAt: studioFleetLogChangedAt,
       refreshedAt: Date.now()
     })
   } catch {
@@ -4934,7 +4959,7 @@ function StudioFleetCodyMainView() {
                 : null
             ]
           }),
-          jsx('div', { className: 'mt-4 text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Live Cody progress' }),
+          jsx('div', { className: 'mt-4 text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Recent Codex output' }),
           state.lines?.length
             ? jsx('div', {
                 className: 'mt-2 space-y-1 rounded-md bg-(--ui-bg-secondary) p-3 font-mono text-xs leading-5 text-(--ui-text-secondary)',
@@ -4943,7 +4968,13 @@ function StudioFleetCodyMainView() {
             : jsx('p', { className: 'mt-2 text-xs text-(--ui-text-tertiary)', children: working ? 'Cody claimed the brief; waiting for the Codex transcript…' : 'No Studio Fleet task is active.' })
         ]
       }),
-      jsx('div', { className: 'border-t border-(--ui-stroke-secondary) px-4 py-2 text-[0.625rem] text-(--ui-text-quaternary)', children: state.refreshedAt ? `Updated ${relativeTime(state.refreshedAt)}` : 'Waiting for status' })
+      jsxs('div', {
+        className: 'flex items-center justify-between border-t border-(--ui-stroke-secondary) px-4 py-2 text-[0.625rem] text-(--ui-text-quaternary)',
+        children: [
+          jsx('span', { children: state.lastOutputAt ? `Last output ${relativeTime(state.lastOutputAt)}` : 'Waiting for first output' }),
+          jsx('span', { className: 'font-mono', children: `${state.logBytes || 0} chars · polling 2.5s` })
+        ]
+      })
     ]
   })
 }
