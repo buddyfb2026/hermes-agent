@@ -116,7 +116,17 @@ const STUDIO_FLEET_ROOT = '/Users/buddystudio1/Projects/studio-fleet'
 const STUDIO_FLEET_QUEUE = `${STUDIO_FLEET_ROOT}/queue`
 const STUDIO_FLEET_LOGS = `${STUDIO_FLEET_ROOT}/cody/logs`
 const STUDIO_FLEET_POLL_MS = 2500
-const $studioFleetCody = atom({ state: 'unknown', preview: '', task: null, refreshedAt: 0 })
+const $studioFleetCody = atom({
+  state: 'unknown',
+  preview: '',
+  task: null,
+  title: '',
+  identity: '',
+  lines: [],
+  logPath: '',
+  worktree: '',
+  refreshedAt: 0
+})
 
 async function studioFleetReadText(path) {
   const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
@@ -145,10 +155,16 @@ function studioFleetFrontmatter(text) {
   return out
 }
 
-function studioFleetProgress(text) {
+function studioFleetProgressLines(text) {
   const lines = String(text || '').split('\n').map(line => line.trim()).filter(Boolean)
   const checklist = lines.filter(line => /^[✓→•]\s/.test(line))
-  const raw = checklist.at(-1) || ''
+  const chosen = checklist.length ? checklist.slice(-14) : lines.slice(-18)
+  return chosen.map(line => (line.length > 240 ? `${line.slice(0, 239)}…` : line))
+}
+
+function studioFleetProgress(text) {
+  const lines = studioFleetProgressLines(text)
+  const raw = lines.at(-1) || ''
   return raw.length > 72 ? `${raw.slice(0, 71)}…` : raw
 }
 
@@ -161,6 +177,11 @@ async function refreshStudioFleetCody() {
         state: pending.length ? 'queued' : 'idle',
         preview: pending.length ? `${pending.length} validated brief${pending.length === 1 ? '' : 's'} queued` : '',
         task: pending[0]?.id || null,
+        title: pending[0]?.id || '',
+        identity: '',
+        lines: [],
+        logPath: '',
+        worktree: '',
         refreshedAt: Date.now()
       })
       return
@@ -168,18 +189,25 @@ async function refreshStudioFleetCody() {
 
     const brief = await studioFleetReadText(task.path)
     const meta = studioFleetFrontmatter(brief)
-    let progress = ''
+    let log = ''
     try {
-      progress = studioFleetProgress(await studioFleetReadText(`${STUDIO_FLEET_LOGS}/${task.id}.codex.log`))
+      log = await studioFleetReadText(`${STUDIO_FLEET_LOGS}/${task.id}.codex.log`)
     } catch {
       // Claim precedes log creation by a few seconds — still truthfully active.
     }
+    const progress = studioFleetProgress(log)
+    const lines = studioFleetProgressLines(log)
     const identity = meta.linear || task.id
     const title = meta.title || task.id
     $studioFleetCody.set({
       state: 'working',
       preview: `${identity}: ${progress || title}`,
       task: task.id,
+      title,
+      identity,
+      lines,
+      logPath: `${STUDIO_FLEET_LOGS}/${task.id}.codex.log`,
+      worktree: `/Users/buddystudio1/CodyWork/${task.id}`,
       refreshedAt: Date.now()
     })
   } catch {
@@ -4862,6 +4890,77 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
   })
 }
 
+let studioFleetCodyWorkspaceClose = null
+
+function StudioFleetCodyMainView() {
+  const state = useValue($studioFleetCody)
+  const working = state.state === 'working'
+  return jsxs('div', {
+    className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-primary)',
+    children: [
+      jsxs('div', {
+        className: 'border-b border-(--ui-stroke-secondary) px-4 py-3',
+        children: [
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx('span', { className: cn('size-2 rounded-full', working ? 'bg-emerald-500' : 'bg-(--ui-text-quaternary)') }),
+              jsx('strong', { className: 'text-sm text-foreground', children: 'Cody · Studio Fleet' }),
+              jsx('span', { className: 'text-xs text-(--ui-text-tertiary)', children: working ? 'Working' : state.state })
+            ]
+          }),
+          jsx('p', {
+            className: 'mt-1 text-xs text-(--ui-text-quaternary)',
+            children: 'Read-only view · real Codex harness · no-network sandbox · GPU lease · host acceptance'
+          })
+        ]
+      }),
+      jsxs('div', {
+        className: 'min-h-0 flex-1 overflow-auto px-4 py-4',
+        children: [
+          jsxs('div', {
+            className: 'rounded-md border border-(--ui-stroke-secondary) p-3',
+            children: [
+              jsx('div', { className: 'text-sm font-semibold text-foreground', children: state.title || state.task || 'Cody is idle' }),
+              jsx('div', { className: 'mt-1 font-mono text-[0.6875rem] text-(--ui-text-tertiary)', children: [state.identity || '', state.task && state.identity !== state.task ? ` · ${state.task}` : ''] }),
+              working
+                ? jsxs('div', {
+                    className: 'mt-3 flex gap-2',
+                    children: [
+                      jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => pluginCtx?.os?.revealPath?.(state.worktree), children: 'Open worktree' }),
+                      jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => pluginCtx?.os?.revealPath?.(state.logPath), children: 'Reveal transcript' })
+                    ]
+                  })
+                : null
+            ]
+          }),
+          jsx('div', { className: 'mt-4 text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Live Cody progress' }),
+          state.lines?.length
+            ? jsx('div', {
+                className: 'mt-2 space-y-1 rounded-md bg-(--ui-bg-secondary) p-3 font-mono text-xs leading-5 text-(--ui-text-secondary)',
+                children: state.lines.map((line, index) => jsx('div', { className: 'break-words', children: line }, `${index}:${line}`))
+              })
+            : jsx('p', { className: 'mt-2 text-xs text-(--ui-text-tertiary)', children: working ? 'Cody claimed the brief; waiting for the Codex transcript…' : 'No Studio Fleet task is active.' })
+        ]
+      }),
+      jsx('div', { className: 'border-t border-(--ui-stroke-secondary) px-4 py-2 text-[0.625rem] text-(--ui-text-quaternary)', children: state.refreshedAt ? `Updated ${relativeTime(state.refreshedAt)}` : 'Waiting for status' })
+    ]
+  })
+}
+
+function openStudioFleetCodyWorkspace() {
+  if (studioFleetCodyWorkspaceClose || typeof host.openWorkspace !== 'function') return Boolean(studioFleetCodyWorkspaceClose)
+  studioFleetCodyWorkspaceClose = host.openWorkspace(`${ID}:studio-fleet-cody`, {
+    title: 'Cody · Studio Fleet',
+    minWidth: '24rem',
+    render: () => jsx(StudioFleetCodyMainView, {}),
+    onClose: () => {
+      studioFleetCodyWorkspaceClose = null
+    }
+  })
+  return true
+}
+
 // ── bot row ──────────────────────────────────────────────────────────────────
 
 function BotRow({ bot, onDelete, onEdit, onGroup }) {
@@ -4941,6 +5040,13 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     haptic('tap')
     $groupChatWorkspace.set(null)
     $selectedBot.set(bot.name)
+
+    // While the real Studio Fleet harness owns Cody's active task, selecting
+    // the existing Cody row opens a read-only live work surface in the center.
+    // Idle clicks keep the normal canonical Bot Chat behavior.
+    if (isStudioFleetCody && ['working', 'queued'].includes(studioFleetCody.state) && openStudioFleetCodyWorkspace()) {
+      return
+    }
 
     if (bot.remoteSource) {
       const handle = botHandle(bot.name, bot)

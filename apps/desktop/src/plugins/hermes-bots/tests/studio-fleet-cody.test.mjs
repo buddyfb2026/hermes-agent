@@ -49,6 +49,11 @@ test('real Cody activity overlays the existing profile with issue and checklist 
     state: 'working',
     preview: 'BIZ-1278: → running tests',
     task: 'build-map',
+    title: 'Build Procore map',
+    identity: 'BIZ-1278',
+    lines: ['• inspect files', '✓ migration complete', '→ running tests'],
+    logPath: '/Users/buddystudio1/Projects/studio-fleet/cody/logs/build-map.codex.log',
+    worktree: '/Users/buddystudio1/CodyWork/build-map',
     refreshedAt: api.$studioFleetCody.get().refreshedAt
   })
 })
@@ -77,5 +82,7 @@ test('overlay is scoped to the existing canonical cody profile only', () => {
   assert.match(source, /bot\.name === 'cody'/)
   assert.match(source, /isStudioFleetCody && \['working', 'queued', 'unavailable'\]\.includes/)
   assert.match(source, /startStudioFleetCodyObserver\(ctx\)/)
+  assert.match(source, /openStudioFleetCodyWorkspace\(\)/)
+  assert.match(source, /title: 'Cody · Studio Fleet'/)
   assert.doesNotMatch(source, /append_message|prompt\.submit.*Studio Fleet/)
 })
