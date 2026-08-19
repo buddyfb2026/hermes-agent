@@ -108,6 +108,92 @@ let watermarksSeeded = false
  *  unread badge already carries the signal. Persisted via ctx.storage. */
 const $activityToasts = atom(false)
 
+// Spencer's hardened Studio Fleet Cody is an external coding harness, not the
+// Hermes profile's model process. Observe its queue directly so the existing
+// Cody roster row tells the truth without re-hosting the model or injecting
+// synthetic messages into Cody's canonical chat/context.
+const STUDIO_FLEET_ROOT = '/Users/buddystudio1/Projects/studio-fleet'
+const STUDIO_FLEET_QUEUE = `${STUDIO_FLEET_ROOT}/queue`
+const STUDIO_FLEET_LOGS = `${STUDIO_FLEET_ROOT}/cody/logs`
+const STUDIO_FLEET_POLL_MS = 2500
+const $studioFleetCody = atom({ state: 'unknown', preview: '', task: null, refreshedAt: 0 })
+
+async function studioFleetReadText(path) {
+  const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
+  if (!desktop?.readFileText) throw new Error('local file bridge unavailable')
+  return (await desktop.readFileText(path)).text || ''
+}
+
+async function studioFleetListBriefs(stage) {
+  const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
+  if (!desktop?.readDir) throw new Error('local directory bridge unavailable')
+  const result = await desktop.readDir(`${STUDIO_FLEET_QUEUE}/${stage}`)
+  return (result?.entries || [])
+    .filter(entry => !entry.isDirectory && entry.name.endsWith('.md'))
+    .map(entry => ({ id: entry.name.slice(0, -3), path: entry.path || `${STUDIO_FLEET_QUEUE}/${stage}/${entry.name}` }))
+    .sort((a, b) => a.id.localeCompare(b.id))
+}
+
+function studioFleetFrontmatter(text) {
+  const match = String(text || '').match(/^---\s*\n([\s\S]*?)\n---/)
+  if (!match) return {}
+  const out = {}
+  for (const line of match[1].split('\n')) {
+    const at = line.indexOf(':')
+    if (at > 0) out[line.slice(0, at).trim()] = line.slice(at + 1).trim()
+  }
+  return out
+}
+
+function studioFleetProgress(text) {
+  const lines = String(text || '').split('\n').map(line => line.trim()).filter(Boolean)
+  const checklist = lines.filter(line => /^[✓→•]\s/.test(line))
+  const raw = checklist.at(-1) || ''
+  return raw.length > 72 ? `${raw.slice(0, 71)}…` : raw
+}
+
+async function refreshStudioFleetCody() {
+  try {
+    const [active, pending] = await Promise.all([studioFleetListBriefs('active'), studioFleetListBriefs('pending')])
+    const task = active[0] || null
+    if (!task) {
+      $studioFleetCody.set({
+        state: pending.length ? 'queued' : 'idle',
+        preview: pending.length ? `${pending.length} validated brief${pending.length === 1 ? '' : 's'} queued` : '',
+        task: pending[0]?.id || null,
+        refreshedAt: Date.now()
+      })
+      return
+    }
+
+    const brief = await studioFleetReadText(task.path)
+    const meta = studioFleetFrontmatter(brief)
+    let progress = ''
+    try {
+      progress = studioFleetProgress(await studioFleetReadText(`${STUDIO_FLEET_LOGS}/${task.id}.codex.log`))
+    } catch {
+      // Claim precedes log creation by a few seconds — still truthfully active.
+    }
+    const identity = meta.linear || task.id
+    const title = meta.title || task.id
+    $studioFleetCody.set({
+      state: 'working',
+      preview: `${identity}: ${progress || title}`,
+      task: task.id,
+      refreshedAt: Date.now()
+    })
+  } catch {
+    // Observation must never break Bot Mode. Fail honest rather than pretending idle.
+    $studioFleetCody.set({ state: 'unavailable', preview: 'Studio Fleet status unavailable', task: null, refreshedAt: Date.now() })
+  }
+}
+
+function startStudioFleetCodyObserver(ctx) {
+  void refreshStudioFleetCody()
+  const timer = setInterval(() => void refreshStudioFleetCody(), STUDIO_FLEET_POLL_MS)
+  if (typeof ctx.onDispose === 'function') ctx.onDispose(() => clearInterval(timer))
+}
+
 /** Flip the activity-toast pref and persist it. */
 function setActivityToasts(enabled) {
   $activityToasts.set(enabled)
@@ -4797,7 +4883,10 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   // Keep user photos/pets. Drop the 160px SVG backfill so the math face can move.
   const photo = Boolean(image && !isBackfilledFacePng(image))
   const gatewayState = useValue(host.state.gateway)
-  const activeNow = Boolean(last?.last_active && Date.now() / 1000 - last.last_active < ACTIVE_WINDOW_S)
+  const studioFleetCody = useValue($studioFleetCody)
+  const isStudioFleetCody = !bot.remoteSource && bot.name === 'cody'
+  const studioFleetWorking = isStudioFleetCody && studioFleetCody.state === 'working'
+  const activeNow = studioFleetWorking || Boolean(last?.last_active && Date.now() / 1000 - last.last_active < ACTIVE_WINDOW_S)
   // Work pose only when this bot is actually doing something: the active
   // profile while the gateway is busy, or a bot that wrote within the
   // liveness window. Not every bot whenever the gateway is busy.
@@ -4815,11 +4904,14 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   const previewSession = bot.preferred_session || last
   const { fromBot } = previewKind(previewSession?.preview)
   // DM previews read like DMs: strip the delivery prefix, keep the message.
-  const displayPreview = stripPreviewMarkdown(
-    fromBot
-      ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
-      : previewSession?.preview || bot.description || 'No conversations yet — say hi'
-  )
+  const displayPreview =
+    isStudioFleetCody && ['working', 'queued', 'unavailable'].includes(studioFleetCody.state)
+      ? studioFleetCody.preview
+      : stripPreviewMarkdown(
+          fromBot
+            ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
+            : previewSession?.preview || bot.description || 'No conversations yet — say hi'
+        )
 
   const warm = () => {
     // Multi-source row: pre-dial the agent's OWN source (feature-detected).
@@ -4967,6 +5059,14 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                           'max-w-[28%] shrink-0 truncate rounded bg-(--chrome-action-hover) px-1 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
                         title: `Lives on ${bot.connectionLabel}`,
                         children: bot.connectionLabel
+                      })
+                    : null,
+                  isStudioFleetCody
+                    ? jsx('span', {
+                        className:
+                          'shrink-0 rounded bg-(--chrome-action-hover) px-1 text-[0.5625rem] font-semibold tracking-wide text-(--ui-text-quaternary)',
+                        title: 'Real Studio Fleet Cody harness — execution stays in its isolated Codex sandbox',
+                        children: 'FLEET'
                       })
                     : null
                 ]
@@ -9946,6 +10046,7 @@ export default {
   register(ctx) {
     pluginCtx = ctx
     startFaceClock()
+    startStudioFleetCodyObserver(ctx)
     // Disabling the plugin (or a hot reload) must actually stop the clock —
     // before this, the rAF loop + 1Hz document scan ran until app restart.
     if (typeof ctx.onDispose === 'function') {
