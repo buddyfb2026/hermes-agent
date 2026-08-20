@@ -265,5 +265,5 @@ test('source contract: the workspace mounts a quiet, collapsed-by-default disclo
   assert.match(pluginSource, /cancelled: 'turn interrupted by a newer message'/)
   // The panel sits inside the workspace between the header and the log.
   const workspace = pluginSource.slice(pluginSource.indexOf('function GroupChatWorkspace('), pluginSource.indexOf('function GroupChatMainView('))
-  assert.match(workspace, /header,\s*\n\s*activityPanel,/s)
+  assert.match(workspace, /header,\s*\n\s*jsx\(IssueRoomOverview,[\s\S]*?\n\s*activityPanel,/s)
 })

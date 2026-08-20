@@ -469,9 +469,12 @@ const $sessionsGatewayGeneration = atom(0)
 /** Group-chat rooms: { [group]: { log: [{from:{kind,name},text,at}], watermarks:{[member]:idx}, epoch, running } }.
  *  Log + watermarks persist via plugin storage; epoch/running are runtime-only. */
 const $groupChats = atom({})
-/** Group whose room view is open in the Bots pane (secondary navigation,
- *  same pattern as $botSessionsWorkspace). */
+/** Group selected in the main workspace. This is selection/highlight state only. */
 const $groupChatWorkspace = atom(null)
+/** Group rendered inside the Bots pane only when this Desktop lacks the
+ * main-workspace SDK door. Keeping fallback presentation separate prevents
+ * one room from rendering in both panes on modern Desktop builds. */
+const $groupChatFallbackWorkspace = atom(null)
 /** Groups whose latest room activity mentions @user — the needs-you badge. */
 const $groupNeedsYou = atom({})
 
@@ -3858,6 +3861,7 @@ function groupChatNames(metaByName, rooms) {
   const names = new Set(knownGroups(metaByName))
 
   for (const [name, room] of Object.entries(rooms || {})) {
+    if (room?.lifecycle?.state === 'archived') continue
     if ((Array.isArray(room?.members) && room.members.length) || (Array.isArray(room?.log) && room.log.length)) {
       names.add(name)
     }
@@ -3893,10 +3897,21 @@ function groupChatMemberBots(group, roster, metaByName) {
     }
 
     seated.add(key)
-    remote.push((roster || []).find(bot => botRosterKey(bot) === key) || descriptor)
+    const live = (roster || []).find(bot => botRosterKey(bot) === key)
+    remote.push(live
+      ? (descriptor.externalWorker ? { ...live, externalWorker: descriptor.externalWorker } : live)
+      : descriptor)
   }
 
   return [...local, ...remote]
+}
+
+/** Members backed by real Hermes profile sessions may take conversational
+ * turns. External workers (CCD and hardened Studio Fleet Cody) are observers:
+ * their authoritative output enters through their own adapters, never through
+ * a synthetic Hermes prompt. */
+function conversationalGroupMembers(members) {
+  return (members || []).filter(member => !member.externalWorker)
 }
 
 /** Persist source-qualified identities for every selected member. The active
@@ -4162,6 +4177,7 @@ function updateGroupChat(group, mutate) {
         members: Array.isArray(room.members) ? room.members : [],
         automation: room.automation && typeof room.automation === 'object' ? room.automation : null,
         externalWorkers: room.externalWorkers && typeof room.externalWorkers === 'object' ? room.externalWorkers : {},
+        lifecycle: room.lifecycle && typeof room.lifecycle === 'object' ? room.lifecycle : null,
         // Room picture (small data URL, same normalization as bot avatars).
         image: room.image || null
       }
@@ -4199,6 +4215,9 @@ async function disbandGroupChat(group, members) {
   if ($groupChatWorkspace.get() === group) {
     $groupChatWorkspace.set(null)
   }
+  if ($groupChatFallbackWorkspace.get() === group) {
+    $groupChatFallbackWorkspace.set(null)
+  }
 
   // Retire the room's MAIN-window tab too (host.openWorkspace path).
   closeGroupChatMainTab(group)
@@ -4222,6 +4241,7 @@ async function disbandGroupChat(group, members) {
           members: Array.isArray(room.members) ? room.members : [],
           automation: room.automation && typeof room.automation === 'object' ? room.automation : null,
           externalWorkers: room.externalWorkers && typeof room.externalWorkers === 'object' ? room.externalWorkers : {},
+        lifecycle: room.lifecycle && typeof room.lifecycle === 'object' ? room.lifecycle : null,
           image: room.image || null
         }
       }
@@ -4360,6 +4380,8 @@ function appendGroupChatEntry(group, from, text, thread, images) {
 // ── Linear issue rooms: observe real Avengers packet authoring ───────────────
 
 const LINEAR_ISSUE_ROOM_ROOT = '/Users/buddystudio1/.hermes/issue-rooms/active'
+const LINEAR_ISSUE_ROOM_ARCHIVE_ROOT = '/Users/buddystudio1/.hermes/issue-rooms/archive'
+const PR_REVIEW_OBSERVER_ROOT = '/Users/buddystudio1/.hermes/external-workers/pr-reviews/active'
 const LINEAR_ISSUE_ROOM_POLL_MS = 1500
 let linearIssueRoomRefreshRunning = false
 
@@ -4417,6 +4439,7 @@ async function syncLinearIssueRoom(record) {
   const member = issueRoomMember(profile, callsign)
   const baseline = Math.max(0, Number(authoring.baseline_message_count) || 0)
   const existing = $groupChats.get()[issueKey] || {}
+  const roomState = record?.room_state === 'archived' ? 'archived' : 'active'
   const priorAutomation = existing.automation || {}
   const isNewJob = priorAutomation.job_id !== jobId
   const cursor = isNewJob ? baseline : Math.max(baseline, Number(priorAutomation.cursor) || baseline)
@@ -4426,6 +4449,7 @@ async function syncLinearIssueRoom(record) {
   const currentMembers = Array.isArray(existing.members) ? existing.members : []
   const sessionId = String(authoring.session_id || '')
   const needsRoomUpdate = isNewJob
+    || existing?.lifecycle?.state !== roomState
     || desiredMembers.some(desired => !currentMembers.some(current => current.name === desired.name))
     || String(priorAutomation.session_id || '') !== sessionId
     || Number(priorAutomation.baseline) !== baseline
@@ -4437,6 +4461,7 @@ async function syncLinearIssueRoom(record) {
         if (!members.some(candidate => candidate.name === descriptor.name)) members.push(descriptor)
       }
       room.members = members
+      room.lifecycle = { ...(room.lifecycle || {}), state: roomState, issueKey, updatedAt: Number(record.updated_at) || Date.now() / 1000 }
       room.automation = {
         kind: 'linear-issue',
         issue_id: String(record.issue_id || ''),
@@ -4577,7 +4602,7 @@ function syncCcdIssueRoom(state) {
       }
       if (chunk) chunks.push(chunk)
       for (const text of chunks.slice(-4)) {
-        room.log.push({ at: Date.now(), from: { kind: 'member', name: 'ccd' }, text, thread })
+        room.log.push({ at: Date.now(), from: { kind: 'member', name: 'ccd' }, text, thread, detail: true })
       }
     }
     room.externalWorkers = {
@@ -4659,7 +4684,7 @@ function syncCodyIssueRoom(state) {
       }
       if (chunk) chunks.push(chunk)
       for (const text of chunks.slice(-4)) {
-        room.log.push({ at: Date.now(), from: { kind: 'member', name: 'cody' }, text, thread })
+        room.log.push({ at: Date.now(), from: { kind: 'member', name: 'cody' }, text, thread, detail: true })
       }
     }
     room.externalWorkers = {
@@ -4679,26 +4704,80 @@ function syncCodyIssueRoom(state) {
   })
 }
 
+function normalizePrReviewRecord(raw) {
+  const issueKey = String(raw?.issue_key || '').trim().toUpperCase()
+  const prNumber = Number(raw?.pr_number) || 0
+  const reviewId = String(raw?.review_id || raw?.thread_id || '')
+  if (!/^[A-Z]{2,10}-\d+$/.test(issueKey) || !prNumber || !reviewId) return null
+  return {
+    issueKey,
+    prNumber,
+    reviewId,
+    provider: String(raw?.provider || 'Frontier reviewer'),
+    state: String(raw?.state || 'reviewing'),
+    url: String(raw?.url || ''),
+    lines: Array.isArray(raw?.lines) ? raw.lines.map(line => String(line).trim()).filter(Boolean).slice(-100) : [],
+    updatedAt: Number(raw?.updated_at) || 0
+  }
+}
+
+function syncPrReviewIssueRoom(raw) {
+  const state = normalizePrReviewRecord(raw)
+  if (!state) return
+  const existing = $groupChats.get()[state.issueKey] || null
+  const prior = existing?.externalWorkers?.prReview || null
+  const newReview = !prior || prior.reviewId !== state.reviewId
+  const delta = ccdLineDelta(newReview ? [] : prior.lines, state.lines)
+  if (!newReview && prior.state === state.state && !delta.length) return
+  const slug = state.provider.toLowerCase().includes('chatgpt') ? 'chatgpt-review' : state.provider.toLowerCase().includes('claude') ? 'claude-review' : 'frontier-review'
+  updateGroupChat(state.issueKey, room => {
+    const members = Array.isArray(room.members) ? [...room.members] : []
+    if (!members.some(member => member.name === slug)) {
+      members.push({ name: slug, title: state.provider, handle: slug, externalWorker: 'pr-review', remoteSource: false, sourceScoped: false })
+    }
+    room.members = members
+    const thread = `pr:${state.prNumber}:${state.reviewId}`
+    if (newReview) room.log.push({ at: Date.now(), from: { kind: 'member', name: slug }, text: `🔎 ${state.provider} joined to review PR #${state.prNumber}.`, thread })
+    if (!newReview && prior.state !== state.state) room.log.push({ at: Date.now(), from: { kind: 'member', name: slug }, text: `PR #${state.prNumber} review is ${state.state}.`, thread })
+    for (const text of delta.slice(-4)) room.log.push({ at: Date.now(), from: { kind: 'member', name: slug }, text: text.slice(0, 1800), thread, detail: true })
+    room.externalWorkers = { ...(room.externalWorkers || {}), prReview: { ...state } }
+    if (['merged', 'complete'].includes(state.state)) room.lifecycle = { ...(room.lifecycle || {}), state: state.state === 'merged' ? 'merged' : (room.lifecycle?.state || 'active') }
+    return room
+  })
+}
+
+async function refreshPrReviewObservers() {
+  const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
+  if (!desktop?.readDir || !desktop?.readFileText) return
+  let entries = []
+  try { entries = (await desktop.readDir(PR_REVIEW_OBSERVER_ROOT))?.entries || [] } catch { return }
+  for (const entry of entries.filter(item => !item.isDirectory && item.name.endsWith('.json'))) {
+    try {
+      const raw = await desktop.readFileText(entry.path || `${PR_REVIEW_OBSERVER_ROOT}/${entry.name}`)
+      syncPrReviewIssueRoom(JSON.parse(raw?.text || '{}'))
+    } catch { /* atomic replacement race — retry next poll */ }
+  }
+}
+
 async function refreshLinearIssueRooms() {
   if (linearIssueRoomRefreshRunning) return
   linearIssueRoomRefreshRunning = true
   try {
     const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
     if (!desktop?.readDir || !desktop?.readFileText) return
-    let entries = []
-    try {
-      entries = (await desktop.readDir(LINEAR_ISSUE_ROOM_ROOT))?.entries || []
-    } catch {
-      return // no issue has been claimed yet
-    }
-    for (const entry of entries.filter(item => !item.isDirectory && item.name.endsWith('.json'))) {
-      try {
-        const raw = await desktop.readFileText(entry.path || `${LINEAR_ISSUE_ROOM_ROOT}/${entry.name}`)
-        await syncLinearIssueRoom(JSON.parse(raw?.text || '{}'))
-      } catch {
-        // Atomic writer replacement can race one poll; next tick reconciles.
+    for (const [root, roomState] of [[LINEAR_ISSUE_ROOM_ROOT, 'active'], [LINEAR_ISSUE_ROOM_ARCHIVE_ROOT, 'archived']]) {
+      let entries = []
+      try { entries = (await desktop.readDir(root))?.entries || [] } catch { continue }
+      for (const entry of entries.filter(item => !item.isDirectory && item.name.endsWith('.json'))) {
+        try {
+          const raw = await desktop.readFileText(entry.path || `${root}/${entry.name}`)
+          const record = JSON.parse(raw?.text || '{}')
+          record.room_state = roomState
+          await syncLinearIssueRoom(record)
+        } catch { /* Atomic writer replacement can race one poll; next tick reconciles. */ }
       }
     }
+    await refreshPrReviewObservers()
   } finally {
     linearIssueRoomRefreshRunning = false
   }
@@ -5141,18 +5220,23 @@ function sendToGroupChat(group, members, text, thread, images) {
   $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
   appendGroupChatEntry(group, { kind: 'user', name: 'You' }, trimmed, target, attached)
 
+  const responders = conversationalGroupMembers(members)
   const wasRunning = ($groupChats.get()[group] || {}).running === true
 
   updateGroupChat(group, room => {
     room.epoch = (room.epoch || 0) + 1
-    room.running = true
+    room.running = responders.length > 0
     return room
   })
 
   recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
 
+  if (!responders.length) {
+    return target
+  }
+
   if (!wasRunning) {
-    void runGroupChatRounds(group, members, target).catch(() => {
+    void runGroupChatRounds(group, responders, target).catch(() => {
       updateGroupChat(group, r => {
         r.running = false
         return r
@@ -5162,7 +5246,7 @@ function sendToGroupChat(group, members, text, thread, images) {
     // A loop is live; it bails at its next boundary. Chain the fresh loop
     // after a short settle so exactly one drive owns the room.
     setTimeout(() => {
-      void runGroupChatRounds(group, members, target).catch(() => {
+      void runGroupChatRounds(group, responders, target).catch(() => {
         updateGroupChat(group, r => {
           r.running = false
           return r
@@ -9563,13 +9647,91 @@ function GroupMentionInput({ members, onChange, value, ...inputProps }) {
   })
 }
 
+function issueRoomStageModel(room) {
+  const authoring = String(room?.automation?.status || '')
+  const ccd = room?.externalWorkers?.ccd || null
+  const cody = room?.externalWorkers?.cody || null
+  const pr = room?.externalWorkers?.prReview || null
+  const lifecycle = String(room?.lifecycle?.state || '')
+  const state = (active, done) => done ? 'done' : active ? 'active' : 'waiting'
+  return [
+    { key: 'authoring', label: 'Authoring', state: state(['claimed', 'authoring'].includes(authoring), authoring === 'packet_ready') },
+    { key: 'design-review', label: 'CCD review', state: state(Boolean(ccd && ['queued', 'reviewing'].includes(ccd.state)), Boolean(ccd && ccd.state === 'idle')) },
+    { key: 'coding', label: 'Coding', state: state(Boolean(cody && cody.state === 'working'), Boolean(cody && cody.state === 'idle')) },
+    { key: 'pr-review', label: 'PR review', state: state(Boolean(pr && ['queued', 'reviewing', 'checks'].includes(pr.state)), Boolean(pr && ['approved', 'merged', 'complete'].includes(pr.state))) },
+    { key: 'merged', label: 'Merged', state: state(lifecycle === 'merging', ['merged', 'archived', 'done'].includes(lifecycle)) }
+  ]
+}
+
+function issueWorkerLabel(key, worker) {
+  if (key === 'ccd') return 'CCD · design review'
+  if (key === 'cody') return 'Cody · coding'
+  if (key === 'prReview') return `${worker?.provider || 'Frontier'} · PR review`
+  return key
+}
+
+function IssueRoomOverview({ room, members, showRaw, onToggleRaw }) {
+  const stages = issueRoomStageModel(room)
+  const responders = conversationalGroupMembers(members)
+  const observers = members.filter(member => member.externalWorker)
+  const workers = Object.entries(room.externalWorkers || {}).filter(([key]) => ['ccd', 'cody', 'prReview'].includes(key))
+  return jsxs('div', {
+    className: 'border-b border-(--ui-stroke-secondary) bg-(--ui-bg-editor) px-3 py-2.5',
+    children: [
+      jsx('div', {
+        className: 'grid grid-cols-5 gap-1.5',
+        children: stages.map(stage => jsxs('div', {
+          className: cn(
+            'rounded-md border px-2 py-1.5',
+            stage.state === 'active' && 'border-amber-500/40 bg-amber-500/8',
+            stage.state === 'done' && 'border-emerald-500/35 bg-emerald-500/8',
+            stage.state === 'waiting' && 'border-(--ui-stroke-secondary) bg-(--ui-bg-elevated)'
+          ),
+          children: [
+            jsx('div', { className: cn('text-[0.625rem] font-semibold uppercase tracking-wide', stage.state === 'active' ? 'text-amber-500' : stage.state === 'done' ? 'text-emerald-500' : 'text-(--ui-text-quaternary)'), children: stage.state }),
+            jsx('div', { className: 'mt-0.5 truncate text-[0.7rem] font-medium text-(--ui-text-secondary)', children: stage.label })
+          ]
+        }, stage.key))
+      }),
+      jsxs('div', {
+        className: 'mt-2 flex flex-wrap items-center gap-1.5 text-[0.65rem]',
+        children: [
+          jsx('span', { className: 'rounded-full border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-2 py-0.5 text-(--ui-text-secondary)', children: `${responders.length} conversational ${responders.length === 1 ? 'agent' : 'agents'}` }),
+          jsx('span', { className: 'rounded-full border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-2 py-0.5 text-(--ui-text-secondary)', children: `${observers.length} read-only ${observers.length === 1 ? 'observer' : 'observers'}` }),
+          workers.length ? jsx('button', { type: 'button', className: 'ml-auto text-(--ui-accent,#4f9cf9) hover:underline', onClick: onToggleRaw, children: showRaw ? 'Hide raw worker output' : 'Show raw worker output' }) : null
+        ]
+      }),
+      workers.length ? jsx('div', {
+        className: 'mt-2 grid gap-1.5 sm:grid-cols-2 xl:grid-cols-3',
+        children: workers.map(([key, worker]) => {
+          const lines = Array.isArray(worker.lines) ? worker.lines.filter(Boolean) : []
+          const latest = lines.length ? lines[lines.length - 1] : ''
+          return jsxs('div', {
+            className: 'min-w-0 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-2.5 py-2',
+            children: [
+              jsxs('div', { className: 'flex items-center justify-between gap-2', children: [
+                jsx('span', { className: 'truncate text-[0.7rem] font-semibold text-foreground', children: issueWorkerLabel(key, worker) }),
+                jsx('span', { className: 'shrink-0 text-[0.625rem] uppercase tracking-wide text-(--ui-text-tertiary)', children: worker.state || 'observing' })
+              ] }),
+              jsx('div', { className: 'mt-1 line-clamp-2 break-words text-[0.68rem] leading-4 text-(--ui-text-tertiary)', children: latest || 'Waiting for authoritative output…' })
+            ]
+          }, key)
+        })
+      }) : null
+    ]
+  })
+}
+
 function GroupChatWorkspace({ group, members, onBack }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
+  const responders = conversationalGroupMembers(members)
+  const observers = members.filter(member => member.externalWorker)
   const [draft, setDraft] = useState('')
   const [confirmDisband, setConfirmDisband] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [showRawWorkerOutput, setShowRawWorkerOutput] = useState(false)
   // Click-to-disambiguate: which log entry is showing its speaker's full
   // @handle (the roster's name-device form when names collide across
   // connections). Naturally every speaker just shows its display name.
@@ -9650,7 +9812,13 @@ function GroupChatWorkspace({ group, members, onBack }) {
       jsx(Button, {
         variant: 'ghost',
         size: 'sm',
-        onClick: () => (onBack ? onBack() : $groupChatWorkspace.set(null)),
+        onClick: () => {
+          if (onBack) onBack()
+          else {
+            $groupChatWorkspace.set(null)
+            $groupChatFallbackWorkspace.set(null)
+          }
+        },
         children: 'Back'
       }),
       // Room picture (set via Group settings) leads the title when present.
@@ -9683,7 +9851,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
       }),
       jsx('span', {
         className: 'shrink-0 text-[0.65rem] text-(--ui-text-quaternary)',
-        children: `${members.length} bots`
+        children: `${responders.length} agents · ${observers.length} observers`
       }),
       jsx(Button, {
         variant: 'ghost',
@@ -10003,6 +10171,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
 
   for (let i = 0; i < room.log.length; i++) {
     const entry = room.log[i]
+    if (entry.detail && !showRawWorkerOutput) continue
     const id = groupThreadOf(entry)
     let bucket = threadsById.get(id)
 
@@ -10091,7 +10260,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
                     'aria-label': 'Reply in thread',
                     autoFocus: true,
                     placeholder: 'Reply in thread…',
-                    members,
+                    members: responders,
                     value: replyDrafts[id] || '',
                     onChange: text => setReplyDrafts(prev => ({ ...prev, [id]: text })),
                     onPaste: event => pasteImages(id, event)
@@ -10149,6 +10318,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
           }, 'dropzone')
         : null,
       header,
+      jsx(IssueRoomOverview, { room, members, showRaw: showRawWorkerOutput, onToggleRaw: () => setShowRawWorkerOutput(value => !value) }),
       activityPanel,
       jsx(ScrollArea, {
         className: 'min-h-0 flex-1',
@@ -10189,8 +10359,8 @@ function GroupChatWorkspace({ group, members, onBack }) {
               children: [
                 jsx(GroupMentionInput, {
                   'aria-label': `Message ${group}`,
-                  placeholder: `New thread in ${group}… (@name to direct, @everyone for all)`,
-                  members,
+                  placeholder: responders.length ? `New thread in ${group}… (@agent to direct)` : `Add a conversational agent to ask questions`,
+                  members: responders,
                   value: draft,
                   onChange: setDraft,
                   onPaste: event => pasteImages(null, event)
@@ -10203,7 +10373,8 @@ function GroupChatWorkspace({ group, members, onBack }) {
                   children: 'New Thread'
                 })
               ]
-            })
+            }),
+            jsx('div', { className: 'mt-1 px-0.5 text-[0.625rem] text-(--ui-text-quaternary)', children: observers.length ? 'Messages invoke conversational Hermes agents only. CCD, Cody, and PR reviewers remain read-only authoritative observers.' : 'Messages invoke the conversational agents shown above.' })
           ]
         })
       }),
@@ -10255,6 +10426,9 @@ function closeGroupChatMainTab(group) {
   if (wasSelected) {
     $groupChatWorkspace.set(null)
   }
+  if ($groupChatFallbackWorkspace.get() === group) {
+    $groupChatFallbackWorkspace.set(null)
+  }
 
   let closedByHost = false
   if (typeof host.closeWorkspace === 'function') {
@@ -10305,6 +10479,7 @@ function GroupChatMainView({ group }) {
 function openGroupChat(group) {
   $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
   $groupChatWorkspace.set(group)
+  $groupChatFallbackWorkspace.set(null)
 
   if (typeof host.openWorkspace === 'function') {
     try {
@@ -10318,6 +10493,7 @@ function openGroupChat(group) {
 
           if (wasSelected) {
             $groupChatWorkspace.set(null)
+            $groupChatFallbackWorkspace.set(null)
             if (typeof host.showChatWorkspace === 'function') host.showChatWorkspace()
           }
         }
@@ -10331,8 +10507,9 @@ function openGroupChat(group) {
     }
   }
 
-  // The selected-group atom was set before trying the main-window door, so
-  // older desktops naturally render the in-panel room as the fallback.
+  // Older desktops have no main-workspace door (or it failed): render the
+  // room inside the Bots pane, never in both surfaces.
+  $groupChatFallbackWorkspace.set(group)
 }
 
 /** One group chat as ONE roster row — the Discord shape: stacked member
@@ -10461,6 +10638,7 @@ function BotsPane() {
   const activityToasts = useValue($activityToasts)
   const sessionsWorkspaceName = useValue($botSessionsWorkspace)
   const groupChatName = useValue($groupChatWorkspace)
+  const fallbackGroupChatName = useValue($groupChatFallbackWorkspace)
   const groupNeedsYou = useValue($groupNeedsYou)
   const groupRooms = useValue($groupChats)
 
@@ -10557,10 +10735,10 @@ function BotsPane() {
     return jsx(ProfileSessionsWorkspace, { bot: sessionsWorkspaceBot })
   }
 
-  const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
+  const groupChatMembers = fallbackGroupChatName ? groupChatMemberBots(fallbackGroupChatName, roster, allMeta) : []
 
-  if (groupChatName && groupChatMembers.length) {
-    return jsx(GroupChatWorkspace, { group: groupChatName, members: groupChatMembers })
+  if (fallbackGroupChatName && groupChatMembers.length) {
+    return jsx(GroupChatWorkspace, { group: fallbackGroupChatName, members: groupChatMembers })
   }
 
   return jsxs('div', {
@@ -11010,6 +11188,7 @@ export default {
                   members: Array.isArray(room.members) ? room.members : [],
                   automation: room.automation && typeof room.automation === 'object' ? room.automation : null,
                   externalWorkers: room.externalWorkers && typeof room.externalWorkers === 'object' ? room.externalWorkers : {},
+        lifecycle: room.lifecycle && typeof room.lifecycle === 'object' ? room.lifecycle : null,
                   image: typeof room.image === 'string' && room.image ? room.image : null,
                   epoch: 0,
                   running: false

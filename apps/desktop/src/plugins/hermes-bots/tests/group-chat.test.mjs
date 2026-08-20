@@ -105,7 +105,7 @@ function load(turnScript, { busyUntilResumeCall } = {}) {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, leaveGroupChatForBot, groupChatMainTabs, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, leaveGroupChatForBot, groupChatMainTabs, groupChatMemberBots, conversationalGroupMembers, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupChatFallbackWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -439,6 +439,41 @@ test('closing an older selected group does not clear or re-front over the newer 
 
   assert.equal(gc.$groupChatWorkspace.get(), 'Ops')
   assert.equal(fronted, 0)
+})
+
+test('main workspace and legacy fallback are mutually exclusive', () => {
+  const modern = load(() => '(pass)')
+  modern.host.openWorkspace = () => () => undefined
+  modern.openGroupChat('BIZ-1066')
+  assert.equal(modern.$groupChatWorkspace.get(), 'BIZ-1066')
+  assert.equal(modern.$groupChatFallbackWorkspace.get(), null)
+
+  const legacy = load(() => '(pass)')
+  legacy.host.openWorkspace = undefined
+  legacy.openGroupChat('BIZ-1066')
+  assert.equal(legacy.$groupChatWorkspace.get(), 'BIZ-1066')
+  assert.equal(legacy.$groupChatFallbackWorkspace.get(), 'BIZ-1066')
+})
+
+test('external worker surfaces never receive conversational model turns', async () => {
+  const gc = load(() => 'should not run')
+  const observers = [
+    { name: 'ccd', externalWorker: 'ccd' },
+    { name: 'cody', externalWorker: 'studio-fleet-cody' }
+  ]
+  assert.equal(gc.conversationalGroupMembers(observers).length, 0)
+  const thread = gc.sendToGroupChat('BIZ-1066', observers, 'status?')
+  assert.ok(thread)
+  assert.equal(gc.$groupChats.get()['BIZ-1066'].running, false)
+  assert.deepEqual(Object.keys(gc.$groupChats.get()['BIZ-1066'].sessions || {}), [])
+  assert.equal(gc.$groupChats.get()['BIZ-1066'].log.length, 1)
+})
+
+test('stored Cody observer identity survives matching a normal live Cody row', () => {
+  const gc = load(() => '(pass)')
+  gc.$groupChats.set({ Room: { members: [{ name: 'cody', externalWorker: 'studio-fleet-cody' }] } })
+  const members = gc.groupChatMemberBots('Room', [{ name: 'cody', display_name: 'Cody' }], {})
+  assert.equal(members[0].externalWorker, 'studio-fleet-cody')
 })
 
 test('source contract: active group styling suppresses bot styling', () => {

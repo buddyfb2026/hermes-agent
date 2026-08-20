@@ -43,7 +43,7 @@ function runtime(pages = []) {
     window: { hermesDesktop: null }
   }
   vm.createContext(context)
-  vm.runInContext(`${slice}\nglobalThis.__test = { syncLinearIssueRoom, issueRoomMessageText }`, context)
+  vm.runInContext(`${slice}\nglobalThis.__test = { syncLinearIssueRoom, issueRoomMessageText, syncPrReviewIssueRoom, normalizePrReviewRecord }`, context)
   return { api: context.__test, rooms: () => rooms }
 }
 
@@ -119,4 +119,35 @@ test('retry preserves prior member and seats the new claiming Avenger', async ()
   assert.deepEqual(JSON.parse(JSON.stringify(room.members.map(member => member.name))), ['hermes3', 'hermes4'])
   assert.equal(room.automation.job_id, 'job-2')
   assert.equal(room.automation.cursor, 2)
+})
+
+test('archived lifecycle hides the active room without deleting its history', async () => {
+  const { api, rooms } = runtime([{ expectedOffset: 5, next_offset: 5, messages: [] }])
+  await api.syncLinearIssueRoom({ ...base, room_state: 'archived' })
+  const room = rooms()['BIZ-9999']
+  assert.equal(room.lifecycle.state, 'archived')
+  assert.ok(room.log.length > 0)
+})
+
+test('explicit PR review metadata seats a read-only Frontier observer and dedupes deltas', () => {
+  const { api, rooms } = runtime()
+  const record = {
+    issue_key: 'BIZ-9999', pr_number: 42, review_id: 'thread-1',
+    provider: 'ChatGPT Desktop', state: 'reviewing', lines: ['Checking packet compliance']
+  }
+  api.syncPrReviewIssueRoom(record)
+  api.syncPrReviewIssueRoom(record)
+  const room = rooms()['BIZ-9999']
+  const observer = room.members.find(member => member.name === 'chatgpt-review')
+  assert.equal(observer.externalWorker, 'pr-review')
+  assert.equal(room.externalWorkers.prReview.prNumber, 42)
+  assert.equal(room.log.filter(entry => /joined to review PR #42/.test(entry.text)).length, 1)
+  assert.equal(room.log.filter(entry => entry.detail).length, 1)
+})
+
+test('PR observer rejects records without explicit issue, PR, or review identity', () => {
+  const { api } = runtime()
+  assert.equal(api.normalizePrReviewRecord({ pr_number: 42, review_id: 'x' }), null)
+  assert.equal(api.normalizePrReviewRecord({ issue_key: 'BIZ-1', review_id: 'x' }), null)
+  assert.equal(api.normalizePrReviewRecord({ issue_key: 'BIZ-1', pr_number: 42 }), null)
 })
