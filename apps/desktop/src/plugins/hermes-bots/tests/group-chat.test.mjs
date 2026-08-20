@@ -104,7 +104,7 @@ function load(turnScript, { busyUntilResumeCall } = {}) {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, leaveGroupChatForBot, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -369,6 +369,26 @@ test('group selection follows main-window open and close', () => {
 
   onClose()
   assert.equal(gc.$groupChatWorkspace.get(), null)
+})
+
+test('Bot-row navigation closes the selected group main tab before opening chat', () => {
+  const gc = load(() => '(pass)')
+  let closed = 0
+  gc.host.openWorkspace = (_id, options) => () => {
+    closed += 1
+    options.onClose()
+  }
+
+  gc.openGroupChat('BIZ-9999')
+  assert.equal(gc.$groupChatWorkspace.get(), 'BIZ-9999')
+  gc.leaveGroupChatForBot()
+  assert.equal(closed, 1)
+  assert.equal(gc.$groupChatWorkspace.get(), null)
+
+  // Idempotent after the tab is gone; a fast double-click cannot close twice.
+  gc.leaveGroupChatForBot()
+  assert.equal(closed, 1)
+  assert.match(pluginSource, /haptic\('tap'\)\s+leaveGroupChatForBot\(\)\s+\$selectedBot\.set/)
 })
 
 test('closing an older selected group does not clear the newer selection', () => {

@@ -5290,7 +5290,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   const open = async () => {
     const generation = ++botOpenGeneration
     haptic('tap')
-    $groupChatWorkspace.set(null)
+    leaveGroupChatForBot()
     $selectedBot.set(bot.name)
 
     // While the real Studio Fleet harness owns Cody's active task, selecting
@@ -9810,6 +9810,14 @@ function closeGroupChatMainTab(group) {
       /* tab already gone */
     }
   }
+}
+
+/** A Bot-row click leaves whichever group owns the center view before opening
+ * the Bot's canonical chat. Clearing only the selection atom strands the real
+ * host workspace on top; reopening the already-underlying Bot then no-ops. */
+function leaveGroupChatForBot() {
+  const group = $groupChatWorkspace.get()
+  if (group) closeGroupChatMainTab(group)
 }
 
 /** Main-window wrapper: seats the member roster reactively (live roster +
