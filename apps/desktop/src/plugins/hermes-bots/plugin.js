@@ -248,6 +248,95 @@ function startStudioFleetCodyObserver(ctx) {
   if (typeof ctx.onDispose === 'function') ctx.onDispose(() => clearInterval(timer))
 }
 
+// CCD is an external Claude Code reviewer. Desktop observes the durable local
+// snapshot produced by ccd_desktop_observer.py; it never sends tmux keys,
+// invokes Claude, or creates a Hermes model session for this identity.
+const CCD_STATE_PATH = '/Users/buddystudio1/.hermes/external-workers/ccd/state.json'
+const CCD_POLL_MS = 2000
+const $ccdWorker = atom({
+  state: 'unavailable',
+  issueKey: '',
+  jobId: '',
+  packetVersion: null,
+  queueStatus: '',
+  sourcePath: '',
+  tmuxTarget: 'claude-ccd-review:0.0',
+  tmuxAvailable: false,
+  lines: [],
+  lastOutputAt: 0,
+  updatedAt: 0,
+  preview: 'CCD observer unavailable'
+})
+
+function normalizeCcdWorker(raw) {
+  const state = ['reviewing', 'queued', 'idle', 'unavailable'].includes(raw?.state) ? raw.state : 'unavailable'
+  const issueKey = String(raw?.issue_key || '').trim().toUpperCase()
+  const packetVersion = Number.isFinite(Number(raw?.packet_version)) ? Number(raw.packet_version) : null
+  const identity = issueKey ? `${issueKey}${packetVersion ? ` v${packetVersion}` : ''}` : ''
+  const preview = state === 'reviewing'
+    ? `${identity || 'Packet'}: independent review in progress`
+    : state === 'queued'
+      ? `${identity || 'Packet'}: queued for CCD review`
+      : state === 'idle'
+        ? (identity ? `Idle · last reviewed ${identity}` : 'Idle · waiting for a packet')
+        : 'CCD observer unavailable'
+  return {
+    state,
+    issueKey: /^[A-Z]+-\d+$/.test(issueKey) ? issueKey : '',
+    jobId: String(raw?.job_id || ''),
+    packetVersion,
+    queueStatus: String(raw?.queue_status || ''),
+    sourcePath: String(raw?.source_path || ''),
+    tmuxTarget: String(raw?.tmux_target || 'claude-ccd-review:0.0'),
+    tmuxAvailable: Boolean(raw?.tmux_available),
+    lines: Array.isArray(raw?.lines) ? raw.lines.map(line => String(line)).filter(Boolean).slice(-100) : [],
+    lastOutputAt: Number(raw?.last_output_at) || 0,
+    updatedAt: Number(raw?.updated_at) || 0,
+    preview
+  }
+}
+
+function ccdRosterRow(state = $ccdWorker.get()) {
+  return {
+    name: 'ccd',
+    display_name: 'CCD',
+    description: 'Independent Claude Code reviewer',
+    externalWorker: 'ccd',
+    externalWorking: state.state === 'reviewing',
+    last_session: {
+      title: state.issueKey ? `CCD review · ${state.issueKey}` : 'CCD review',
+      preview: state.preview,
+      last_active: state.lastOutputAt || state.updatedAt || 0
+    }
+  }
+}
+
+function withCcdWorkerRow(roster, state = $ccdWorker.get()) {
+  const base = roster && typeof roster === 'object' ? roster : { profiles: [] }
+  const profiles = (Array.isArray(base.profiles) ? base.profiles : []).filter(bot => bot?.externalWorker !== 'ccd' && bot?.name !== 'ccd')
+  return { ...base, profiles: [...profiles, ccdRosterRow(state)] }
+}
+
+async function refreshCcdWorker() {
+  try {
+    const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
+    if (!desktop?.readFileText) throw new Error('local file bridge unavailable')
+    const result = await desktop.readFileText(CCD_STATE_PATH)
+    const state = normalizeCcdWorker(JSON.parse(result?.text || '{}'))
+    $ccdWorker.set(state)
+    syncCcdIssueRoom(state)
+  } catch {
+    $ccdWorker.set(normalizeCcdWorker({ state: 'unavailable' }))
+  }
+}
+
+function startCcdObserver(ctx) {
+  void refreshCcdWorker()
+  if (typeof setInterval !== 'function') return
+  const timer = setInterval(() => void refreshCcdWorker(), CCD_POLL_MS)
+  if (typeof ctx.onDispose === 'function') ctx.onDispose(() => clearInterval(timer))
+}
+
 /** Flip the activity-toast pref and persist it. */
 function setActivityToasts(enabled) {
   $activityToasts.set(enabled)
@@ -2887,13 +2976,13 @@ function useRoster() {
       if (typeof host.agents === 'function') {
         try {
           const union = await host.agents()
-          return mergeMultiSourceRoster(local, union, activeConnectionId, $lastRoster.get())
+          return withCcdWorkerRow(mergeMultiSourceRoster(local, union, activeConnectionId, $lastRoster.get()))
         } catch {
           /* older build or roster failure — single-source list stands */
         }
       }
 
-      return local
+      return withCcdWorkerRow(local)
     },
     refetchInterval: 5000,
     staleTime: 5000,
@@ -4038,6 +4127,7 @@ function updateGroupChat(group, mutate) {
         // active connection changes and today's local members become remote.
         members: Array.isArray(room.members) ? room.members : [],
         automation: room.automation && typeof room.automation === 'object' ? room.automation : null,
+        externalWorkers: room.externalWorkers && typeof room.externalWorkers === 'object' ? room.externalWorkers : {},
         // Room picture (small data URL, same normalization as bot avatars).
         image: room.image || null
       }
@@ -4097,6 +4187,7 @@ async function disbandGroupChat(group, members) {
           sessions: room.sessions || {},
           members: Array.isArray(room.members) ? room.members : [],
           automation: room.automation && typeof room.automation === 'object' ? room.automation : null,
+          externalWorkers: room.externalWorkers && typeof room.externalWorkers === 'object' ? room.externalWorkers : {},
           image: room.image || null
         }
       }
@@ -4384,6 +4475,90 @@ async function syncLinearIssueRoom(record) {
       return room
     })
   }
+}
+
+function ccdLineDelta(previous, current) {
+  const before = Array.isArray(previous) ? previous : []
+  const after = Array.isArray(current) ? current : []
+  const limit = Math.min(before.length, after.length)
+  for (let size = limit; size > 0; size -= 1) {
+    if (before.slice(-size).every((line, index) => line === after[index])) return after.slice(size)
+  }
+  return after
+}
+
+function syncCcdIssueRoom(state) {
+  const issueKey = String(state?.issueKey || '').trim().toUpperCase()
+  const jobId = String(state?.jobId || '')
+  if (!/^[A-Z]+-\d+$/.test(issueKey) || !jobId) return
+
+  const existing = $groupChats.get()[issueKey] || null
+  const prior = existing?.externalWorkers?.ccd || null
+  const active = state.state === 'reviewing' || state.state === 'queued'
+  // Idle history must never retroactively create a room. Once CCD joined this
+  // exact job, however, its terminal idle transition remains visible.
+  if (!active && (!prior || prior.jobId !== jobId)) return
+
+  const newJob = !prior || prior.jobId !== jobId
+  const delta = state.state === 'reviewing' ? ccdLineDelta(newJob ? [] : prior.lines, state.lines) : []
+  const statusChanged = newJob || prior.state !== state.state
+  if (!newJob && !delta.length && !statusChanged) return
+
+  updateGroupChat(issueKey, room => {
+    const members = Array.isArray(room.members) ? [...room.members] : []
+    if (!members.some(member => member.name === 'ccd')) {
+      members.push({ name: 'ccd', title: 'CCD', handle: 'ccd', externalWorker: 'ccd', remoteSource: false, sourceScoped: false })
+    }
+    room.members = members
+    const thread = `ccd:${jobId}`
+    if (newJob) {
+      room.log.push({
+        at: Date.now(),
+        from: { kind: 'member', name: 'ccd' },
+        text: `🔬 CCD joined to independently review ${issueKey}${state.packetVersion ? ` packet v${state.packetVersion}` : ''}.`,
+        thread
+      })
+    }
+    if (statusChanged && !newJob) {
+      const text = state.state === 'reviewing'
+        ? `🔬 CCD started reviewing ${issueKey}.`
+        : state.state === 'queued'
+          ? `⏳ ${issueKey} is queued for CCD review.`
+          : state.state === 'idle'
+            ? '✓ CCD returned to idle; review output remains in this room.'
+            : '⚠️ CCD observer became unavailable.'
+      room.log.push({ at: Date.now(), from: { kind: 'member', name: 'ccd' }, text, thread })
+    }
+    if (delta.length) {
+      const chunks = []
+      let chunk = ''
+      for (const line of delta) {
+        const next = chunk ? `${chunk}\n${line}` : line
+        if (next.length > 1800 && chunk) {
+          chunks.push(chunk)
+          chunk = line
+        } else {
+          chunk = next
+        }
+      }
+      if (chunk) chunks.push(chunk)
+      for (const text of chunks.slice(-4)) {
+        room.log.push({ at: Date.now(), from: { kind: 'member', name: 'ccd' }, text, thread })
+      }
+    }
+    room.externalWorkers = {
+      ...(room.externalWorkers || {}),
+      ccd: {
+        jobId,
+        issueKey,
+        packetVersion: state.packetVersion,
+        state: state.state,
+        lines: [...state.lines],
+        lastOutputAt: state.lastOutputAt
+      }
+    }
+    return room
+  })
 }
 
 async function refreshLinearIssueRooms() {
@@ -5102,6 +5277,7 @@ const ACTIVE_WINDOW_S = 90
  *  presence never reorders or hides the normal list. */
 function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
   return (roster || []).filter(bot => {
+    if (bot.externalWorker) return Boolean(bot.externalWorking)
     const busyTurn = !bot.remoteSource && bot.name === activeProfile && gatewayState === 'busy'
     const last = bot.last_session?.last_active || 0
     const inWindow = Boolean(last && now / 1000 - last < ACTIVE_WINDOW_S)
@@ -5209,6 +5385,102 @@ function openStudioFleetCodyWorkspace() {
   return true
 }
 
+let ccdWorkspaceClose = null
+
+function CcdMainView() {
+  const state = useValue($ccdWorker)
+  const active = state.state === 'reviewing'
+  const identity = state.issueKey
+    ? `${state.issueKey}${state.packetVersion ? ` · packet v${state.packetVersion}` : ''}`
+    : 'No packet active'
+  return jsxs('div', {
+    className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-primary)',
+    children: [
+      jsxs('div', {
+        className: 'border-b border-(--ui-stroke-secondary) px-4 py-3',
+        children: [
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx('span', { className: cn('size-2 rounded-full', active ? 'bg-emerald-500' : state.state === 'unavailable' ? 'bg-red-500' : 'bg-(--ui-text-quaternary)') }),
+              jsx('strong', { className: 'text-sm text-foreground', children: 'CCD · Independent Review' }),
+              jsx('span', { className: 'text-xs capitalize text-(--ui-text-tertiary)', children: state.state })
+            ]
+          }),
+          jsx('p', {
+            className: 'mt-1 text-xs text-(--ui-text-quaternary)',
+            children: 'Read-only view · real Claude Code reviewer · no Hermes model session · no prompt relay'
+          })
+        ]
+      }),
+      jsxs('div', {
+        className: 'min-h-0 flex-1 overflow-auto px-4 py-4',
+        children: [
+          jsxs('div', {
+            className: 'rounded-md border border-(--ui-stroke-secondary) p-3',
+            children: [
+              jsx('div', { className: 'text-sm font-semibold text-foreground', children: identity }),
+              jsx('div', { className: 'mt-1 font-mono text-[0.6875rem] text-(--ui-text-tertiary)', children: [state.queueStatus || 'idle', state.jobId ? ` · ${state.jobId}` : ''] }),
+              jsxs('div', {
+                className: 'mt-3 flex gap-2',
+                children: [
+                  state.sourcePath
+                    ? jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => pluginCtx?.os?.revealPath?.(state.sourcePath), children: 'Reveal queue record' })
+                    : null,
+                  jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => pluginCtx?.os?.revealPath?.(CCD_STATE_PATH), children: 'Reveal observer state' })
+                ]
+              })
+            ]
+          }),
+          jsx('div', { className: 'mt-4 text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Recent authoritative CCD output' }),
+          state.lines.length
+            ? jsx('div', {
+                className: 'mt-2 space-y-1 rounded-md bg-(--ui-bg-secondary) p-3 font-mono text-xs leading-5 text-(--ui-text-secondary)',
+                children: state.lines.map((line, index) => jsx('div', { className: 'break-words whitespace-pre-wrap', children: line }, `${index}:${line}`))
+              })
+            : jsx('p', { className: 'mt-2 text-xs text-(--ui-text-tertiary)', children: state.state === 'unavailable' ? 'CCD observer or tmux session unavailable.' : 'CCD is idle; no active review output.' })
+        ]
+      }),
+      jsxs('div', {
+        className: 'flex items-center justify-between border-t border-(--ui-stroke-secondary) px-4 py-2 text-[0.625rem] text-(--ui-text-quaternary)',
+        children: [
+          jsx('span', { children: state.lastOutputAt ? `Last output ${relativeTime(state.lastOutputAt * 1000)}` : 'Waiting for output' }),
+          jsx('span', { className: 'font-mono', children: `${state.tmuxTarget} · polling 2s` })
+        ]
+      })
+    ]
+  })
+}
+
+function closeCcdWorkspace() {
+  const close = ccdWorkspaceClose
+  ccdWorkspaceClose = null
+  if ($botWorkspaceProfile.get() === 'ccd') $botWorkspaceProfile.set(null)
+  try {
+    close?.()
+  } catch {
+    /* workspace may already be gone */
+  }
+}
+
+function openCcdWorkspace() {
+  if (ccdWorkspaceClose || typeof host.openWorkspace !== 'function') {
+    if (ccdWorkspaceClose) $botWorkspaceProfile.set('ccd')
+    return Boolean(ccdWorkspaceClose)
+  }
+  ccdWorkspaceClose = host.openWorkspace(`${ID}:ccd-review`, {
+    title: 'CCD · Independent Review',
+    minWidth: '24rem',
+    render: () => jsx(CcdMainView, {}),
+    onClose: () => {
+      ccdWorkspaceClose = null
+      if ($botWorkspaceProfile.get() === 'ccd') $botWorkspaceProfile.set(null)
+    }
+  })
+  if (ccdWorkspaceClose) $botWorkspaceProfile.set('ccd')
+  return true
+}
+
 // ── bot row ──────────────────────────────────────────────────────────────────
 
 function BotRow({ bot, onDelete, onEdit, onGroup }) {
@@ -5235,9 +5507,12 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   const photo = Boolean(image && !isBackfilledFacePng(image))
   const gatewayState = useValue(host.state.gateway)
   const studioFleetCody = useValue($studioFleetCody)
+  const ccdWorker = useValue($ccdWorker)
   const isStudioFleetCody = !bot.remoteSource && bot.name === 'cody'
+  const isCcdWorker = bot.externalWorker === 'ccd'
   const studioFleetWorking = isStudioFleetCody && studioFleetCody.state === 'working'
-  const activeNow = studioFleetWorking || Boolean(last?.last_active && Date.now() / 1000 - last.last_active < ACTIVE_WINDOW_S)
+  const ccdWorking = isCcdWorker && ccdWorker.state === 'reviewing'
+  const activeNow = studioFleetWorking || ccdWorking || (!bot.externalWorker && Boolean(last?.last_active && Date.now() / 1000 - last.last_active < ACTIVE_WINDOW_S))
   // Work pose only when this bot is actually doing something: the active
   // profile while the gateway is busy, or a bot that wrote within the
   // liveness window. Not every bot whenever the gateway is busy.
@@ -5265,6 +5540,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
         )
 
   const warm = () => {
+    if (bot.externalWorker) return
     // Multi-source row: pre-dial the agent's OWN source (feature-detected).
     if (bot.sourceScoped && typeof host.warmAgent === 'function') {
       try {
@@ -5292,6 +5568,13 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     haptic('tap')
     leaveGroupChatForBot()
     $selectedBot.set(bot.name)
+
+    if (isCcdWorker) {
+      closeStudioFleetCodyWorkspace()
+      openCcdWorkspace()
+      return
+    }
+    closeCcdWorkspace()
 
     // While the real Studio Fleet harness owns Cody's active task, selecting
     // the existing Cody row opens a read-only live work surface in the center.
@@ -5430,6 +5713,14 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                         title: 'Real Studio Fleet Cody harness — execution stays in its isolated Codex sandbox',
                         children: 'FLEET'
                       })
+                    : null,
+                  isCcdWorker
+                    ? jsx('span', {
+                        className:
+                          'shrink-0 rounded bg-(--chrome-action-hover) px-1 text-[0.5625rem] font-semibold tracking-wide text-(--ui-text-quaternary)',
+                        title: 'Independent Claude Code reviewer — read-only observer surface',
+                        children: 'REVIEW'
+                      })
                     : null
                 ]
               }),
@@ -5481,7 +5772,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   // metadata is not loaded yet, so edit/delete/pin/group actions would mutate
   // whichever backend happens to be active. A normal click activates the
   // owner; the refreshed rich row then exposes the full context menu.
-  if (bot.remoteSource) {
+  if (bot.remoteSource || bot.externalWorker) {
     return row
   }
 
@@ -7493,10 +7784,11 @@ async function loadRoutines(profile) {
   }
 }
 
-function useRoutines(profile) {
+function useRoutines(profile, enabled = true) {
   return useQuery({
     queryKey: [...ROUTINES_KEY, profile || ''],
     queryFn: () => loadRoutines(profile),
+    enabled,
     refetchInterval: 20000,
     staleTime: 8000
   })
@@ -8088,8 +8380,10 @@ function RoutinesPane() {
   // otherwise the focused chat's owner remains authoritative.
   const bot = (workspaceProfile || focusedProfile || selected || 'default').trim() || 'default'
   const meta = useValue($botMeta)[bot]
+  const ccdState = useValue($ccdWorker)
+  const isCcd = bot === 'ccd'
   const { shape, color, image } = botAppearance(bot, meta)
-  const { data, error, isLoading, refetch } = useRoutines(bot)
+  const { data, error, isLoading, refetch } = useRoutines(bot, !isCcd)
   const [createOpen, setCreateOpen] = useState(false)
   const [createOwner, setCreateOwner] = useState(null)
   const createTarget = routineCreateTarget(createOwner, bot)
@@ -8097,6 +8391,45 @@ function RoutinesPane() {
   const openCreate = () => {
     setCreateOwner(bot)
     setCreateOpen(true)
+  }
+
+  if (isCcd) {
+    return jsxs('div', {
+      className: 'flex h-full flex-col',
+      children: [
+        jsxs('div', {
+          className: 'flex items-center gap-2 px-3 pt-3 pb-2',
+          children: [
+            jsx(BotFace, { shape, color, image, size: 22, name: 'ccd', mood: ccdState.state === 'reviewing' ? 'work' : 'idle' }),
+            jsxs('div', {
+              className: 'min-w-0 flex-1',
+              children: [
+                jsx('div', { className: 'truncate text-xs font-semibold', children: 'CCD' }),
+                jsx('div', { className: 'text-[0.65rem] uppercase tracking-wider text-(--ui-text-quaternary)', children: 'Independent reviewer' })
+              ]
+            })
+          ]
+        }),
+        jsx('div', { className: 'mx-3 border-t border-(--ui-stroke-secondary)' }),
+        jsxs('div', {
+          className: 'space-y-3 p-3 text-xs',
+          children: [
+            jsxs('div', {
+              className: 'rounded-md border border-(--ui-stroke-secondary) p-2.5',
+              children: [
+                jsxs('div', { className: 'flex items-center gap-2', children: [
+                  jsx('span', { className: cn('size-2 rounded-full', ccdState.state === 'reviewing' ? 'bg-emerald-500' : ccdState.state === 'unavailable' ? 'bg-red-500' : 'bg-(--ui-text-quaternary)') }),
+                  jsx('span', { className: 'font-medium capitalize', children: ccdState.state })
+                ] }),
+                jsx('div', { className: 'mt-1 text-(--ui-text-tertiary)', children: ccdState.issueKey ? `${ccdState.issueKey}${ccdState.packetVersion ? ` · v${ccdState.packetVersion}` : ''}` : 'Waiting for a packet' })
+              ]
+            }),
+            jsx('p', { className: 'leading-5 text-(--ui-text-tertiary)', children: 'This surface observes the real Claude Code CCD process. It has no Hermes model, composer, cronjobs, or writable session.' }),
+            jsx('div', { className: 'font-mono text-[0.65rem] text-(--ui-text-quaternary)', children: ccdState.tmuxAvailable ? ccdState.tmuxTarget : 'tmux unavailable' })
+          ]
+        })
+      ]
+    })
   }
 
   const view = selectRoutineJobs(data, error, $lastJobs.get(), bot)
@@ -10433,6 +10766,7 @@ export default {
     pluginCtx = ctx
     startFaceClock()
     startStudioFleetCodyObserver(ctx)
+    startCcdObserver(ctx)
     startLinearIssueRoomObserver(ctx)
     // Disabling the plugin (or a hot reload) must actually stop the clock —
     // before this, the rAF loop + 1Hz document scan ran until app restart.
@@ -10557,6 +10891,7 @@ export default {
                   stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
                   members: Array.isArray(room.members) ? room.members : [],
                   automation: room.automation && typeof room.automation === 'object' ? room.automation : null,
+                  externalWorkers: room.externalWorkers && typeof room.externalWorkers === 'object' ? room.externalWorkers : {},
                   image: typeof room.image === 'string' && room.image ? room.image : null,
                   epoch: 0,
                   running: false

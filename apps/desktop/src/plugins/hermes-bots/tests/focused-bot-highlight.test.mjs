@@ -19,13 +19,15 @@ test('$focusedBotProfile prefers the focused-session owner atom and falls back t
   )
 })
 
-test('BotRow keys the highlight off the focused profile, not the socket home', () => {
+test('BotRow keys the highlight off the center-workspace owner, then focused profile', () => {
   const rowStart = source.indexOf('function BotRow(')
   assert.ok(rowStart >= 0)
-  const row = source.slice(rowStart, rowStart + 2000)
+  const row = source.slice(rowStart, rowStart + 2400)
 
   assert.match(row, /const focusedProfile = useValue\(\$focusedBotProfile\)/)
-  assert.match(row, /const isActive = !activeGroup && !bot\.remoteSource && bot\.name === focusedProfile/)
+  assert.match(row, /const workspaceProfile = useValue\(\$botWorkspaceProfile\)/)
+  assert.match(row, /const visibleProfile = workspaceProfile \|\| focusedProfile/)
+  assert.match(row, /const isActive = !activeGroup && !bot\.remoteSource && bot\.name === visibleProfile/)
 })
 
 test('BotRow keeps turn-busy (work mood) a socket fact', () => {
@@ -38,13 +40,14 @@ test('BotRow keeps turn-busy (work mood) a socket fact', () => {
   assert.match(row, /const botMood = \(isGatewayHome && gatewayState === 'busy'\) \|\| activeNow \? 'work' : 'idle'/)
 })
 
-test('RoutinesPane scopes the Cronjobs tile to the focused chat owner', () => {
+test('RoutinesPane scopes the right tile to workspace owner, then focused chat owner', () => {
   const paneStart = source.indexOf('function RoutinesPane(')
   assert.ok(paneStart >= 0)
-  const pane = source.slice(paneStart, paneStart + 1200)
+  const pane = source.slice(paneStart, paneStart + 1400)
 
   assert.match(pane, /const focusedProfile = useValue\(\$focusedBotProfile\)/)
-  assert.match(pane, /const bot = \(focusedProfile \|\| selected \|\| 'default'\)\.trim\(\) \|\| 'default'/)
+  assert.match(pane, /const workspaceProfile = useValue\(\$botWorkspaceProfile\)/)
+  assert.match(pane, /const bot = \(workspaceProfile \|\| focusedProfile \|\| selected \|\| 'default'\)\.trim\(\) \|\| 'default'/)
   assert.ok(!/useValue\(host\.state\.profile\)/.test(pane), 'the tile must not read the socket-home atom directly')
 })
 
