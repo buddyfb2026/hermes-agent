@@ -1,0 +1,36 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import test from 'node:test'
+
+const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
+
+function between(start, end) {
+  const from = source.indexOf(start)
+  const to = source.indexOf(end, from)
+  assert.ok(from >= 0 && to > from)
+  return source.slice(from, to)
+}
+
+test('Cody workspace uses neutral elevated cards and a left-aligned code log', () => {
+  const view = between('function StudioFleetCodyMainView()', 'function closeStudioFleetCodyWorkspace')
+  assert.match(view, /bg-\(--ui-bg-editor\)/)
+  assert.match(view, /bg-\(--ui-bg-elevated\)/)
+  assert.match(view, /font-mono text-\[0\.75rem\]/)
+  assert.match(view, /break-words text-left/)
+  assert.doesNotMatch(view, /bg-\(--ui-bg-secondary\)/)
+})
+
+test('CCD workspace uses a proportional neutral reading surface', () => {
+  const view = between('function CcdMainView()', 'function closeCcdWorkspace')
+  assert.match(view, /bg-\(--ui-bg-editor\)/)
+  assert.match(view, /bg-\(--ui-bg-elevated\)/)
+  assert.match(view, /text-\[0\.8125rem\] leading-6/)
+  assert.match(view, /whitespace-pre-wrap text-left/)
+  assert.doesNotMatch(view, /bg-\(--ui-bg-secondary\)/)
+  assert.doesNotMatch(view, /p-4 font-mono/)
+})
+
+test('external worker transcript lines discard terminal indentation', () => {
+  assert.match(source, /studioFleetTranscriptTail[\s\S]*?\.map\(line => line\.trim\(\)\)/)
+  assert.match(source, /raw\.lines\.map\(line => String\(line\)\.trim\(\)\)/)
+})

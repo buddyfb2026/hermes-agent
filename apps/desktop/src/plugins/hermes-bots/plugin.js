@@ -180,7 +180,7 @@ function studioFleetChecklistLines(text) {
 function studioFleetTranscriptTail(text) {
   return String(text || '')
     .split('\n')
-    .map(line => line.trimEnd())
+    .map(line => line.trim())
     .filter(Boolean)
     .slice(-24)
     .map(line => (line.length > 260 ? `${line.slice(0, 259)}…` : line))
@@ -323,7 +323,7 @@ function normalizeCcdWorker(raw) {
     sourcePath: String(raw?.source_path || ''),
     tmuxTarget: String(raw?.tmux_target || 'claude-ccd-review:0.0'),
     tmuxAvailable: Boolean(raw?.tmux_available),
-    lines: Array.isArray(raw?.lines) ? raw.lines.map(line => String(line)).filter(Boolean).slice(-100) : [],
+    lines: Array.isArray(raw?.lines) ? raw.lines.map(line => String(line).trim()).filter(Boolean).slice(-100) : [],
     lastOutputAt: Number(raw?.last_output_at) || 0,
     updatedAt: Number(raw?.updated_at) || 0,
     preview
@@ -5410,7 +5410,7 @@ function StudioFleetCodyMainView() {
   const state = useValue($studioFleetCody)
   const working = state.state === 'working'
   return jsxs('div', {
-    className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-primary)',
+    className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-editor)',
     children: [
       jsxs('div', {
         className: 'border-b border-(--ui-stroke-secondary) px-4 py-3',
@@ -5433,7 +5433,7 @@ function StudioFleetCodyMainView() {
         className: 'min-h-0 flex-1 overflow-auto px-4 py-4',
         children: [
           jsxs('div', {
-            className: 'rounded-md border border-(--ui-stroke-secondary) p-3',
+            className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) p-3 shadow-sm',
             children: [
               jsx('div', { className: 'text-sm font-semibold text-foreground', children: state.title || state.task || 'Cody is idle' }),
               jsx('div', { className: 'mt-1 font-mono text-[0.6875rem] text-(--ui-text-tertiary)', children: [state.identity || '', state.task && state.identity !== state.task ? ` · ${state.task}` : ''] }),
@@ -5448,11 +5448,11 @@ function StudioFleetCodyMainView() {
                 : null
             ]
           }),
-          jsx('div', { className: 'mt-4 text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Recent Codex output' }),
+          jsx('div', { className: 'mt-4 text-[0.6875rem] font-semibold uppercase tracking-[0.08em] text-(--ui-text-tertiary)', children: 'Recent Codex output' }),
           state.lines?.length
             ? jsx('div', {
-                className: 'mt-2 space-y-1 rounded-md bg-(--ui-bg-secondary) p-3 font-mono text-xs leading-5 text-(--ui-text-secondary)',
-                children: state.lines.map((line, index) => jsx('div', { className: 'break-words', children: line }, `${index}:${line}`))
+              className: 'mt-2 space-y-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) p-4 font-mono text-[0.75rem] leading-5 text-(--ui-text-primary) shadow-sm',
+              children: state.lines.map((line, index) => jsx('div', { className: 'break-words text-left', children: line }, `${index}:${line}`))
               })
             : jsx('p', { className: 'mt-2 text-xs text-(--ui-text-tertiary)', children: working ? 'Cody claimed the brief; waiting for the Codex transcript…' : 'No Studio Fleet task is active.' })
         ]
@@ -5512,7 +5512,7 @@ function CcdMainView() {
     ? `${state.issueKey}${state.packetVersion ? ` · packet v${state.packetVersion}` : ''}`
     : 'No packet active'
   return jsxs('div', {
-    className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-primary)',
+    className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-editor)',
     children: [
       jsxs('div', {
         className: 'border-b border-(--ui-stroke-secondary) px-4 py-3',
@@ -5535,7 +5535,7 @@ function CcdMainView() {
         className: 'min-h-0 flex-1 overflow-auto px-4 py-4',
         children: [
           jsxs('div', {
-            className: 'rounded-md border border-(--ui-stroke-secondary) p-3',
+            className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) p-3 shadow-sm',
             children: [
               jsx('div', { className: 'text-sm font-semibold text-foreground', children: identity }),
               jsx('div', { className: 'mt-1 font-mono text-[0.6875rem] text-(--ui-text-tertiary)', children: [state.queueStatus || 'idle', state.jobId ? ` · ${state.jobId}` : ''] }),
@@ -5550,11 +5550,11 @@ function CcdMainView() {
               })
             ]
           }),
-          jsx('div', { className: 'mt-4 text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)', children: 'Recent authoritative CCD output' }),
+          jsx('div', { className: 'mt-4 text-[0.6875rem] font-semibold uppercase tracking-[0.08em] text-(--ui-text-tertiary)', children: 'Recent authoritative CCD output' }),
           state.lines.length
             ? jsx('div', {
-                className: 'mt-2 space-y-1 rounded-md bg-(--ui-bg-secondary) p-3 font-mono text-xs leading-5 text-(--ui-text-secondary)',
-                children: state.lines.map((line, index) => jsx('div', { className: 'break-words whitespace-pre-wrap', children: line }, `${index}:${line}`))
+              className: 'mt-2 space-y-2 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) p-4 text-[0.8125rem] leading-6 text-(--ui-text-primary) shadow-sm',
+              children: state.lines.map((line, index) => jsx('div', { className: 'break-words whitespace-pre-wrap text-left', children: line }, `${index}:${line}`))
               })
             : jsx('p', { className: 'mt-2 text-xs text-(--ui-text-tertiary)', children: state.state === 'unavailable' ? 'CCD observer or tmux session unavailable.' : 'CCD is idle; no active review output.' })
         ]
