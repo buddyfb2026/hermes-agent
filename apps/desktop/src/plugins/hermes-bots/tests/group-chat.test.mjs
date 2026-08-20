@@ -105,7 +105,7 @@ function load(turnScript, { busyUntilResumeCall } = {}) {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, leaveGroupChatForBot, groupChatMainTabs, groupChatMemberBots, conversationalGroupMembers, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupChatFallbackWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, leaveGroupChatForBot, groupChatMainTabs, groupChatNames, groupChatMemberBots, conversationalGroupMembers, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupChatFallbackWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -117,6 +117,20 @@ function load(turnScript, { busyUntilResumeCall } = {}) {
 }
 
 const MEMBERS = [{ name: 'research', title: '' }, { name: 'builder', title: '' }, { name: 'ops', title: 'The Ops' }]
+
+test('archived issue rooms are hidden by default and recoverable on demand', () => {
+  const gc = load(() => 'ok')
+  const rooms = {
+    'BIZ-1': { lifecycle: { state: 'active' }, log: [{ text: 'active' }], members: [] },
+    'BIZ-2': { lifecycle: { state: 'archived' }, log: [{ text: 'done' }], members: [] }
+  }
+
+  assert.deepEqual(JSON.parse(JSON.stringify(gc.groupChatNames({}, rooms))), ['BIZ-1'])
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(gc.groupChatNames({}, rooms, { includeArchived: true }))),
+    ['BIZ-1', 'BIZ-2']
+  )
+})
 
 function roomLog(gc, group) {
   return (gc.$groupChats.get()[group] || { log: [] }).log

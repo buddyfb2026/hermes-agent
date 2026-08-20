@@ -475,6 +475,9 @@ const $groupChatWorkspace = atom(null)
  * main-workspace SDK door. Keeping fallback presentation separate prevents
  * one room from rendering in both panes on modern Desktop builds. */
 const $groupChatFallbackWorkspace = atom(null)
+/** Session-only roster toggle for completed Linear rooms. Archived records are
+ * already authoritative/persisted on disk; this controls presentation only. */
+const $showArchivedGroups = atom(false)
 /** Groups whose latest room activity mentions @user — the needs-you badge. */
 const $groupNeedsYou = atom({})
 
@@ -3857,11 +3860,13 @@ function groupMembershipPatch(meta, group, enabled) {
 /** Group chats that should hold a roster row: every group named in bot meta
  *  (local members) plus every room record that still has stored members or
  *  log — cross-connection rooms whose members can't ride bot-meta. */
-function groupChatNames(metaByName, rooms) {
-  const names = new Set(knownGroups(metaByName))
+function groupChatNames(metaByName, rooms, { includeArchived = false } = {}) {
+  const names = new Set(
+    knownGroups(metaByName).filter(name => includeArchived || rooms?.[name]?.lifecycle?.state !== 'archived')
+  )
 
   for (const [name, room] of Object.entries(rooms || {})) {
-    if (room?.lifecycle?.state === 'archived') continue
+    if (!includeArchived && room?.lifecycle?.state === 'archived') continue
     if ((Array.isArray(room?.members) && room.members.length) || (Array.isArray(room?.log) && room.log.length)) {
       names.add(name)
     }
@@ -10522,7 +10527,7 @@ function openGroupChat(group) {
  *  (markdown flattened), relative time of the last activity, and the
  *  needs-you badge on the row itself. Sorts into the same recency ordering
  *  as bot rows; clicking opens the room in the main chat window. */
-function GroupRow({ active, group, members, needsYou, onOpen }) {
+function GroupRow({ active, group, members, needsYou, archived, onOpen }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [] }
@@ -10600,7 +10605,13 @@ function GroupRow({ active, group, members, needsYou, onOpen }) {
                   jsx('span', {
                     className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
                     children: `${members.length} bots`
-                  })
+                  }),
+                  archived
+                    ? jsx('span', {
+                        className: 'shrink-0 rounded-full border border-(--ui-border) px-1.5 text-[0.6rem] font-medium text-(--ui-text-tertiary)',
+                        children: 'archived'
+                      })
+                    : null
                 ]
               }),
               needsYou
@@ -10646,6 +10657,7 @@ function BotsPane() {
   const fallbackGroupChatName = useValue($groupChatFallbackWorkspace)
   const groupNeedsYou = useValue($groupNeedsYou)
   const groupRooms = useValue($groupChats)
+  const showArchivedGroups = useValue($showArchivedGroups)
 
   // The socket opening (boot, SSH reconnect, sleep/wake) is the signal to
   // retry immediately instead of waiting out the poll interval.
@@ -10701,13 +10713,15 @@ function BotsPane() {
   // group's activity is its newest room-log line. Pinned bots still lead;
   // groups and unpinned bots interleave by recency below them.
   const needle = query.trim().toLowerCase()
-  const groupRows = groupChatNames(allMeta, groupRooms)
+  const archivedGroupCount = Object.values(groupRooms).filter(room => room?.lifecycle?.state === 'archived').length
+  const groupRows = groupChatNames(allMeta, groupRooms, { includeArchived: showArchivedGroups })
     .filter(name => !needle || name.toLowerCase().includes(needle))
     .map(name => ({
       kind: 'group',
       name,
       members: groupChatMemberBots(name, roster, allMeta),
-      activity: groupLastActivity(groupRooms[name])
+      activity: groupLastActivity(groupRooms[name]),
+      archived: groupRooms[name]?.lifecycle?.state === 'archived'
     }))
   const rosterRows = [
     ...filteredRoster.map(bot => ({ kind: 'bot', bot, pinned: isPinned(bot), activity: activityOf(bot) })),
@@ -10795,6 +10809,23 @@ function BotsPane() {
                             })
                           : null
                       ]
+                    })
+                  })
+                : null,
+              archivedGroupCount
+                ? jsx(Tip, {
+                    label: showArchivedGroups
+                      ? 'Hide archived issue rooms'
+                      : `Show ${archivedGroupCount} archived issue room${archivedGroupCount === 1 ? '' : 's'}`,
+                    children: jsx('button', {
+                      type: 'button',
+                      'aria-label': showArchivedGroups ? 'Hide archived issue rooms' : 'Show archived issue rooms',
+                      className: cn(
+                        'flex size-6 items-center justify-center rounded-md transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+                        showArchivedGroups ? 'text-foreground' : 'text-(--ui-text-tertiary)'
+                      ),
+                      onClick: () => $showArchivedGroups.set(!showArchivedGroups),
+                      children: jsx(Codicon, { name: 'archive' })
                     })
                   })
                 : null,
@@ -10976,6 +11007,7 @@ function BotsPane() {
                               active: groupChatName === row.name,
                               group: row.name,
                               members: row.members,
+                              archived: row.archived,
                               needsYou: Boolean(groupNeedsYou[row.name]),
                               onOpen: openGroupChat
                             },
