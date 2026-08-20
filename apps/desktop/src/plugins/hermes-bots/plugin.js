@@ -120,6 +120,9 @@ const $studioFleetCody = atom({
   state: 'unknown',
   preview: '',
   task: null,
+  jobId: '',
+  issueKey: '',
+  sourcePath: '',
   title: '',
   identity: '',
   lines: [],
@@ -157,6 +160,14 @@ function studioFleetFrontmatter(text) {
   return out
 }
 
+function studioFleetIssueKey(meta) {
+  // `linear` is the Studio Fleet schema's trigger-neutral routing field. Never
+  // infer from the brief id/title: an ad-hoc task without explicit linkage
+  // stays visible in Cody's own surface and joins no issue room.
+  const key = String(meta?.linear || '').trim().toUpperCase()
+  return /^[A-Z]{2,10}-\d+$/.test(key) ? key : ''
+}
+
 function studioFleetChecklistLines(text) {
   const lines = String(text || '').split('\n').map(line => line.trim()).filter(Boolean)
   const unique = []
@@ -189,19 +200,36 @@ async function refreshStudioFleetCody() {
     const [active, pending] = await Promise.all([studioFleetListBriefs('active'), studioFleetListBriefs('pending')])
     const task = active[0] || null
     if (!task) {
-      $studioFleetCody.set({
-        state: pending.length ? 'queued' : 'idle',
-        preview: pending.length ? `${pending.length} validated brief${pending.length === 1 ? '' : 's'} queued` : '',
-        task: pending[0]?.id || null,
-        title: pending[0]?.id || '',
-        identity: '',
-        lines: [],
-        logPath: '',
-        worktree: '',
-        logBytes: 0,
-        lastOutputAt: 0,
-        refreshedAt: Date.now()
-      })
+      const previous = $studioFleetCody.get()
+      let queuedMeta = {}
+      if (pending[0]) {
+        try {
+          queuedMeta = studioFleetFrontmatter(await studioFleetReadText(pending[0].path))
+        } catch {
+          /* queue row still remains truthfully queued without optional metadata */
+        }
+      }
+      const terminal = previous.state === 'working' && previous.jobId
+      const state = terminal
+        ? { ...previous, state: 'idle', preview: '', refreshedAt: Date.now() }
+        : {
+            state: pending.length ? 'queued' : 'idle',
+            preview: pending.length ? `${pending.length} validated brief${pending.length === 1 ? '' : 's'} queued` : '',
+            task: pending[0]?.id || null,
+            jobId: pending[0]?.id || '',
+            issueKey: studioFleetIssueKey(queuedMeta),
+            sourcePath: pending[0]?.path || '',
+            title: queuedMeta.title || pending[0]?.id || '',
+            identity: studioFleetIssueKey(queuedMeta) || '',
+            lines: [],
+            logPath: '',
+            worktree: '',
+            logBytes: 0,
+            lastOutputAt: 0,
+            refreshedAt: Date.now()
+          }
+      $studioFleetCody.set(state)
+      if (terminal) syncCodyIssueRoom(state)
       return
     }
 
@@ -220,12 +248,16 @@ async function refreshStudioFleetCody() {
       studioFleetLogSignature = signature
       studioFleetLogChangedAt = Date.now()
     }
-    const identity = meta.linear || task.id
+    const issueKey = studioFleetIssueKey(meta)
+    const identity = issueKey || task.id
     const title = meta.title || task.id
-    $studioFleetCody.set({
+    const state = {
       state: 'working',
       preview: `${identity}: ${progress || title}`,
       task: task.id,
+      jobId: task.id,
+      issueKey,
+      sourcePath: task.path,
       title,
       identity,
       lines,
@@ -234,7 +266,9 @@ async function refreshStudioFleetCody() {
       logBytes: log.length,
       lastOutputAt: studioFleetLogChangedAt,
       refreshedAt: Date.now()
-    })
+    }
+    $studioFleetCody.set(state)
+    syncCodyIssueRoom(state)
   } catch {
     // Observation must never break Bot Mode. Fail honest rather than pretending idle.
     $studioFleetCody.set({ state: 'unavailable', preview: 'Studio Fleet status unavailable', task: null, refreshedAt: Date.now() })
@@ -4555,6 +4589,90 @@ function syncCcdIssueRoom(state) {
         state: state.state,
         lines: [...state.lines],
         lastOutputAt: state.lastOutputAt
+      }
+    }
+    return room
+  })
+}
+
+function codyLineDelta(previous, current) {
+  const before = Array.isArray(previous) ? previous : []
+  const after = Array.isArray(current) ? current : []
+  const limit = Math.min(before.length, after.length)
+  for (let size = limit; size > 0; size -= 1) {
+    if (before.slice(-size).every((line, index) => line === after[index])) return after.slice(size)
+  }
+  return after
+}
+
+function syncCodyIssueRoom(state) {
+  const issueKey = String(state?.issueKey || '').trim().toUpperCase()
+  const jobId = String(state?.jobId || '')
+  if (!/^[A-Z]{2,10}-\d+$/.test(issueKey) || !jobId) return
+
+  const existing = $groupChats.get()[issueKey] || null
+  const prior = existing?.externalWorkers?.cody || null
+  const active = state.state === 'working'
+  // A queued task has not started. Idle history must not create old rooms; only
+  // the terminal transition of a Cody run already seated in this room is kept.
+  if (!active && (!prior || prior.jobId !== jobId)) return
+
+  const newJob = !prior || prior.jobId !== jobId
+  const delta = active ? codyLineDelta(newJob ? [] : prior.lines, state.lines) : []
+  const statusChanged = newJob || prior.state !== state.state
+  if (!newJob && !delta.length && !statusChanged) return
+
+  updateGroupChat(issueKey, room => {
+    const members = Array.isArray(room.members) ? [...room.members] : []
+    if (!members.some(member => member.name === 'cody')) {
+      members.push({ name: 'cody', title: 'Cody', handle: 'cody', externalWorker: 'studio-fleet-cody', remoteSource: false, sourceScoped: false })
+    }
+    room.members = members
+    const thread = `cody:${jobId}`
+    if (newJob) {
+      room.log.push({
+        at: Date.now(),
+        from: { kind: 'member', name: 'cody' },
+        text: `🛠 Cody joined to code ${issueKey} through the hardened Studio Fleet lane.`,
+        thread
+      })
+    }
+    if (statusChanged && !newJob && state.state === 'idle') {
+      room.log.push({
+        at: Date.now(),
+        from: { kind: 'member', name: 'cody' },
+        text: '✓ Cody’s active run ended; its result and transcript remain in this room.',
+        thread
+      })
+    }
+    if (delta.length) {
+      const chunks = []
+      let chunk = ''
+      for (const line of delta) {
+        const next = chunk ? `${chunk}\n${line}` : line
+        if (next.length > 1800 && chunk) {
+          chunks.push(chunk)
+          chunk = line
+        } else {
+          chunk = next
+        }
+      }
+      if (chunk) chunks.push(chunk)
+      for (const text of chunks.slice(-4)) {
+        room.log.push({ at: Date.now(), from: { kind: 'member', name: 'cody' }, text, thread })
+      }
+    }
+    room.externalWorkers = {
+      ...(room.externalWorkers || {}),
+      cody: {
+        jobId,
+        issueKey,
+        state: state.state,
+        lines: [...state.lines],
+        lastOutputAt: state.lastOutputAt,
+        sourcePath: state.sourcePath,
+        logPath: state.logPath,
+        worktree: state.worktree
       }
     }
     return room

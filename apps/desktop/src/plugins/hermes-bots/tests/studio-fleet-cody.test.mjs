@@ -18,11 +18,13 @@ function runtime(desktop) {
     clearInterval() {},
     console,
     Date,
+    syncCodyIssueRoom() {},
+    syncCcdIssueRoom() {},
     setInterval() { return 1 },
     window: { hermesDesktop: desktop }
   }
   vm.createContext(context)
-  vm.runInContext(`${slice}\nglobalThis.__test = { $studioFleetCody, refreshStudioFleetCody, studioFleetFrontmatter, studioFleetProgress }`, context)
+  vm.runInContext(`${slice}\nglobalThis.__test = { $studioFleetCody, refreshStudioFleetCody, studioFleetFrontmatter, studioFleetIssueKey, studioFleetProgress }`, context)
   return context.__test
 }
 
@@ -49,6 +51,9 @@ test('real Cody activity overlays the existing profile with issue and checklist 
     state: 'working',
     preview: 'BIZ-1278: → running tests',
     task: 'build-map',
+    jobId: 'build-map',
+    issueKey: 'BIZ-1278',
+    sourcePath: '/active/build-map.md',
     title: 'Build Procore map',
     identity: 'BIZ-1278',
     lines: ['• inspect files', '✓ migration complete', '→ running tests'],
@@ -58,6 +63,13 @@ test('real Cody activity overlays the existing profile with issue and checklist 
     lastOutputAt: api.$studioFleetCody.get().lastOutputAt,
     refreshedAt: api.$studioFleetCody.get().refreshedAt
   })
+})
+
+test('issue-room routing uses only the explicit trigger-neutral linear field', () => {
+  const api = runtime({})
+  assert.equal(api.studioFleetIssueKey({ linear: 'BIZ-1066' }), 'BIZ-1066')
+  assert.equal(api.studioFleetIssueKey({ linear: 'bad' }), '')
+  assert.equal(api.studioFleetIssueKey({ id: 'biz-1066-fix', title: 'BIZ-1066 fix' }), '')
 })
 
 test('idle Studio Fleet preserves the normal Cody Bot Chat preview', async () => {
