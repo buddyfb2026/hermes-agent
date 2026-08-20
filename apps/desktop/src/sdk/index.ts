@@ -218,6 +218,7 @@ const $activeConnectionId = computed($connection, connection => {
 
 const DEFAULT_SESSION_HYDRATION_TIMEOUT_MS = 20_000
 let openSessionGeneration = 0
+const pluginWorkspaceClosers = new Map<string, () => void>()
 
 interface PluginOpenSessionOptions {
   awaitHydration?: boolean
@@ -621,6 +622,9 @@ export const host = {
     }
 
     const paneId = `plugin-workspace:${key}`
+    // A re-open owns the same identity. Retire the previous registration first
+    // so its stale disposer can never remove the replacement later.
+    pluginWorkspaceClosers.get(paneId)?.()
 
     const dispose = registry.register({
       area: 'panes',
@@ -637,12 +641,14 @@ export const host = {
     })
 
     const close = () => {
+      if (pluginWorkspaceClosers.get(paneId) === close) pluginWorkspaceClosers.delete(paneId)
       registerPaneCloser(paneId)
       dispose()
       removeTreePane(paneId)
       options.onClose?.()
     }
 
+    pluginWorkspaceClosers.set(paneId, close)
     // Route the tab's Close through OUR teardown: without a closer, closing a
     // core-sourced contributed pane only dismisses it and the registration
     // would leak past the plugin surface that owns it.
@@ -650,6 +656,24 @@ export const host = {
     revealTreePane(paneId)
 
     return close
+  },
+
+  /** Close a plugin workspace by stable id. Unlike a caller-held disposer,
+   * this survives plugin-local state loss and can clean up a restored layout
+   * pane directly from the authoritative registry/tree. */
+  closeWorkspace: (id: string): boolean => {
+    const key = (id ?? '').trim()
+    if (!key) return false
+    const paneId = `plugin-workspace:${key}`
+    const close = pluginWorkspaceClosers.get(paneId)
+    if (close) {
+      close()
+      return true
+    }
+    registerPaneCloser(paneId)
+    registry.remove('panes', paneId)
+    removeTreePane(paneId)
+    return true
   },
 
   /** Re-front the canonical main chat workspace after a plugin workspace

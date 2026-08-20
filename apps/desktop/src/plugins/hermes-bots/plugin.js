@@ -9797,6 +9797,7 @@ const groupChatMainTabs = new Map()
 function closeGroupChatMainTab(group) {
   const close = groupChatMainTabs.get(group)
   const wasSelected = $groupChatWorkspace.get() === group
+  const workspaceId = `${ID}:group:${slugify(group)}`
 
   groupChatMainTabs.delete(group)
 
@@ -9804,7 +9805,16 @@ function closeGroupChatMainTab(group) {
     $groupChatWorkspace.set(null)
   }
 
-  if (typeof close === 'function') {
+  let closedByHost = false
+  if (typeof host.closeWorkspace === 'function') {
+    try {
+      closedByHost = host.closeWorkspace(workspaceId) !== false
+    } catch {
+      /* older/partial host — fall back to the caller-held disposer */
+    }
+  }
+
+  if (!closedByHost && typeof close === 'function') {
     try {
       close()
     } catch {

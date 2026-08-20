@@ -105,7 +105,7 @@ function load(turnScript, { busyUntilResumeCall } = {}) {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, leaveGroupChatForBot, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, leaveGroupChatForBot, groupChatMainTabs, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -357,8 +357,11 @@ test('source contract: workspace + main-window door + prompt rules are wired', (
 })
 
 test('Back and Bot exits explicitly re-front the canonical chat workspace', () => {
+  assert.match(sdkSource, /closeWorkspace: \(id: string\): boolean/)
+  assert.match(sdkSource, /registry\.remove\('panes', paneId\)/)
   assert.match(sdkSource, /showChatWorkspace:\s*\(\): void => \{\s*revealTreePane\('workspace'\)/)
   assert.match(pluginSource, /onBack: \(\) => closeGroupChatMainTab\(group\)/)
+  assert.match(pluginSource, /host\.closeWorkspace\(workspaceId\)/)
   assert.match(pluginSource, /wasSelected && typeof host\.showChatWorkspace === 'function'/)
 })
 
@@ -379,6 +382,25 @@ test('group selection follows main-window open and close', () => {
   onClose()
   assert.equal(gc.$groupChatWorkspace.get(), null)
   assert.equal(fronted, 1)
+})
+
+test('Back closes by authoritative workspace id when the plugin-local disposer was lost', () => {
+  const gc = load(() => '(pass)')
+  let localClosed = 0
+  let hostClosed = ''
+  let fronted = 0
+  gc.host.openWorkspace = () => () => { localClosed += 1 }
+  gc.host.closeWorkspace = id => { hostClosed = id; return true }
+  gc.host.showChatWorkspace = () => { fronted += 1 }
+
+  gc.openGroupChat('BIZ-1066')
+  gc.groupChatMainTabs.clear() // restored/hot-reloaded pane: local map is gone
+  gc.leaveGroupChatForBot()
+
+  assert.equal(hostClosed, 'hermes-bots:group:biz-1066')
+  assert.equal(localClosed, 0)
+  assert.equal(fronted, 1)
+  assert.equal(gc.$groupChatWorkspace.get(), null)
 })
 
 test('Bot-row navigation closes the selected group main tab before opening chat', () => {

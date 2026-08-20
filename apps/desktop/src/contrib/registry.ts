@@ -49,6 +49,15 @@ class ContributionRegistry {
     return () => this.removeMany(cs.map(c => ({ area: c.area, id: c.id })))
   }
 
+  /** Remove one contribution by its authoritative area/id identity. Returns
+   * whether a live contribution existed. Generic host surfaces use this to
+   * retire restored panes when their original disposer did not survive. */
+  remove = (area: string, id: string): boolean => {
+    const changed = this.take(area, id)
+    if (changed) this.invalidate([area])
+    return changed
+  }
+
   /** Resolved, sorted, filtered entries for an area. Stable ref until mutated. */
   getArea = (area: string): readonly Contribution[] => {
     const cached = this.snapshot.get(area)
