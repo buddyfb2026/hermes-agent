@@ -140,6 +140,13 @@ class TestClaimSqlPinning:
         # `claimed_by IS NULL` claim — must include lease-expiry reclaim.
         assert "claimed_by IS NULL OR lease_expires_at < now()" in CLAIM_NEXT_HERMES_JOB_SQL
 
+    def test_transient_retry_deadline_blocks_fleet_reclaim(self):
+        assert "metadata->'retry_after_epoch' IS NULL" in CLAIM_NEXT_HERMES_JOB_SQL
+        assert "retry_after_epoch" in RELEASE_JOB_SQL
+        assert "transient_attempts" in RELEASE_JOB_SQL
+        assert "LEAST(" in RELEASE_JOB_SQL
+        assert "last_error = $3" in RELEASE_JOB_SQL
+
     def test_returning_star(self):
         assert "RETURNING *" in CLAIM_NEXT_HERMES_JOB_SQL
 
@@ -382,6 +389,19 @@ def _row(claim_id="rid-1", issue_key="BIZ-208", packet_version=2):
 # ---------------------------------------------------------------------------
 
 
+def test_claim_only_does_not_seat_an_avenger(tmp_path):
+    path = write_issue_room_state(
+        tmp_path,
+        _row(claim_id="claim-only", issue_key="BIZ-9998"),
+        profile_name="hermes4",
+        callsign="Black Widow",
+        status="claimed",
+    )
+    state = json.loads(path.read_text())
+    assert state["members"] == []
+    assert state["authoring"]["status"] == "claimed"
+
+
 def test_issue_room_state_is_atomic_privacy_bounded_and_preserves_members(tmp_path):
     first = _row(claim_id="job-1", issue_key="BIZ-9999")
     path = write_issue_room_state(
@@ -413,6 +433,16 @@ def test_issue_room_state_is_atomic_privacy_bounded_and_preserves_members(tmp_pa
         profile_name="hermes4",
         callsign="Black Widow",
         status="claimed",
+    )
+    updated = json.loads(path.read_text())
+    assert [member["profile"] for member in updated["members"]] == ["hermes3"]
+    write_issue_room_state(
+        tmp_path,
+        retry,
+        profile_name="hermes4",
+        callsign="Black Widow",
+        status="authoring",
+        session_key="telegram-key-2",
     )
     updated = json.loads(path.read_text())
     assert [member["profile"] for member in updated["members"]] == ["hermes3", "hermes4"]
@@ -448,7 +478,7 @@ async def test_process_row_publishes_claim_and_terminal_status(tmp_path):
     worker = _make_worker(pool=pool, runner=fake_runner, issue_room_root=tmp_path)
     await worker._process_row(_row())
     state = json.loads((tmp_path / "BIZ-208.json").read_text())
-    assert state["members"][0]["callsign"] == "Black Widow"
+    assert state["members"] == []  # injected runner never opened an authoring session
     assert state["authoring"]["status"] == "packet_ready"
     # Packet completion does not close the issue room; Linear Done owns closure later.
     assert state["room_state"] == "active"
@@ -903,6 +933,63 @@ class TestRateLimitBackoff:
         assert worker._rate_limit_backoff_seconds == 0.0
 
 
+@pytest.mark.asyncio
+async def test_interactive_worker_registers_modern_session_owner_and_releases_guard(monkeypatch):
+    from gateway.config import Platform
+
+    class Adapter:
+        def __init__(self):
+            self._active_sessions = {}
+            self._session_tasks = {}
+            self._session_store = None
+            self.saw_owner = False
+
+        async def _process_message_background(self, _event, session_key):
+            owner = asyncio.current_task()
+            self.saw_owner = self._session_tasks.get(session_key) is owner
+            # Mirror modern BasePlatformAdapter's owner-aware cleanup.
+            guard = self._active_sessions.get(session_key)
+            if self._session_tasks.get(session_key) is owner:
+                if self._active_sessions.get(session_key) is guard:
+                    self._active_sessions.pop(session_key, None)
+                self._session_tasks.pop(session_key, None)
+
+    adapter = Adapter()
+    worker = _make_worker()
+    worker.adapters = {Platform.TELEGRAM: adapter}
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "8743044208")
+    success, error = await worker._run_packet_authoring(_row())
+    assert success is True and error is None
+    assert adapter.saw_owner is True
+    assert adapter._active_sessions == {}
+    assert adapter._session_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_worker_safety_net_clears_only_its_own_session_guard(monkeypatch):
+    from gateway.config import Platform
+
+    class Adapter:
+        def __init__(self):
+            self._active_sessions = {}
+            self._session_tasks = {}
+            self._session_store = None
+
+        async def _process_message_background(self, _event, _session_key):
+            # Deliberately omit BasePlatformAdapter cleanup; the worker's
+            # owner-matched safety net must still prevent a permanent lock.
+            return None
+
+    adapter = Adapter()
+    worker = _make_worker()
+    worker.adapters = {Platform.TELEGRAM: adapter}
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "8743044208")
+    success, error = await worker._run_packet_authoring(_row())
+    assert success is True and error is None
+    assert adapter._active_sessions == {}
+    assert adapter._session_tasks == {}
+
+
 class TestZeroApiCallsConstantsWiring:
     def test_marker_embedded_in_error_message(self):
         assert ZERO_API_CALLS_MARKER in ZERO_API_CALLS_ERROR.lower()
@@ -927,7 +1014,7 @@ class TestZeroApiCallsWriteback:
         release_calls = [c for c in execute_calls if "claimed_by = NULL" in c[1]]
         assert release_calls, f"expected RELEASE, got {execute_calls}"
         assert release_calls[0][1] == RELEASE_JOB_SQL
-        assert release_calls[0][2] == ("rid-1", "Black Widow")
+        assert release_calls[0][2] == ("rid-1", "Black Widow", ZERO_API_CALLS_ERROR)
         # Critically: it must NOT mark the row failed_at (permanent disqualify).
         assert not any("failed_at = now()" in c[1] for c in execute_calls)
 

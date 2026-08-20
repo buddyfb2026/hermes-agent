@@ -4382,6 +4382,7 @@ function appendGroupChatEntry(group, from, text, thread, images) {
 const LINEAR_ISSUE_ROOM_ROOT = '/Users/buddystudio1/.hermes/issue-rooms/active'
 const LINEAR_ISSUE_ROOM_ARCHIVE_ROOT = '/Users/buddystudio1/.hermes/issue-rooms/archive'
 const PR_REVIEW_OBSERVER_ROOT = '/Users/buddystudio1/.hermes/external-workers/pr-reviews/active'
+const ISSUE_ROOM_AVENGER_PROFILES = new Set(['default', 'hermes2', 'hermes3', 'hermes4', 'hermes5'])
 const LINEAR_ISSUE_ROOM_POLL_MS = 1500
 let linearIssueRoomRefreshRunning = false
 
@@ -4444,8 +4445,9 @@ async function syncLinearIssueRoom(record) {
   const isNewJob = priorAutomation.job_id !== jobId
   const cursor = isNewJob ? baseline : Math.max(baseline, Number(priorAutomation.cursor) || baseline)
 
+  const status = String(authoring.status || '')
   const desiredMembers = (record.members || []).map(joined => issueRoomMember(joined.profile, joined.callsign))
-  if (!desiredMembers.some(candidate => candidate.name === member.name)) desiredMembers.push(member)
+  if (status === 'authoring' && !desiredMembers.some(candidate => candidate.name === member.name)) desiredMembers.push(member)
   const currentMembers = Array.isArray(existing.members) ? existing.members : []
   const sessionId = String(authoring.session_id || '')
   const needsRoomUpdate = isNewJob
@@ -4517,7 +4519,6 @@ async function syncLinearIssueRoom(record) {
     }
   }
 
-  const status = String(authoring.status || '')
   const after = $groupChats.get()[issueKey] || {}
   if (status && after.automation?.status !== status) {
     const text = issueRoomStatusText(status, callsign)

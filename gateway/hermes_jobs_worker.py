@@ -62,6 +62,11 @@ UPDATE hermes_jobs
       WHERE completed_at IS NULL
         AND failed_at IS NULL
         AND (claimed_by IS NULL OR lease_expires_at < now())
+        AND (
+          metadata->'retry_after_epoch' IS NULL
+          OR jsonb_typeof(metadata->'retry_after_epoch') <> 'number'
+          OR (metadata->>'retry_after_epoch')::double precision <= extract(epoch FROM now())
+        )
       AND (
         metadata->>'exclude_callsign' IS NULL
         OR metadata->>'exclude_callsign' = ''
@@ -137,7 +142,40 @@ RELEASE_JOB_SQL = """
 UPDATE hermes_jobs
    SET claimed_by = NULL,
        claimed_at = NULL,
-       lease_expires_at = NULL
+       lease_expires_at = NULL,
+       last_error = $3,
+       metadata = jsonb_set(
+         jsonb_set(
+           COALESCE(metadata, '{}'::jsonb),
+           '{transient_attempts}',
+           to_jsonb(
+             (CASE
+               WHEN COALESCE(metadata->>'transient_attempts', '') ~ '^[0-9]+$'
+               THEN (metadata->>'transient_attempts')::integer
+               ELSE 0
+             END) + 1
+           ),
+           true
+         ),
+         '{retry_after_epoch}',
+         to_jsonb(
+           extract(epoch FROM now()) + LEAST(
+             300,
+             15 * power(
+               2,
+               LEAST(
+                 5,
+                 CASE
+                   WHEN COALESCE(metadata->>'transient_attempts', '') ~ '^[0-9]+$'
+                   THEN (metadata->>'transient_attempts')::integer
+                   ELSE 0
+                 END
+               )
+             )
+           )
+         ),
+         true
+       )
  WHERE id = $1
    AND claimed_by = $2
    AND completed_at IS NULL
@@ -257,7 +295,10 @@ def write_issue_room_state(
 
     now = time.time()
     members = [m for m in existing.get("members", []) if isinstance(m, dict)]
-    if not any(m.get("profile") == profile_name for m in members):
+    # A claim is tentative and may be released before any model turn starts.
+    # Seat an Avenger only once a real authoring session exists; otherwise a
+    # busy-chat retry storm paints every poller as a participant.
+    if status == "authoring" and not any(m.get("profile") == profile_name for m in members):
         members.append({"profile": profile_name, "callsign": callsign, "joined_at": now})
 
     previous = existing.get("authoring")
@@ -898,9 +939,10 @@ class HermesJobsWorker:
                             RELEASE_JOB_SQL,
                             row_id,
                             self.callsign,
+                            (error_msg or "transient failure")[:8000],
                         )
                     logger.warning(
-                        "HermesJobsWorker (%s) released %s v%s (transient: %s) — row returned to unclaimed pool for retry",
+                        "HermesJobsWorker (%s) released %s v%s (transient: %s) — row deferred with fleet-wide exponential backoff",
                         self.callsign, issue_key, packet_version, error_msg,
                     )
                 else:
@@ -1013,6 +1055,15 @@ class HermesJobsWorker:
 
         interrupt_event = asyncio.Event()
         adapter._active_sessions[session_key] = interrupt_event
+        # Modern Hermes gateways release a session guard only when the running
+        # task is registered as that session's owner. The queue worker invokes
+        # _process_message_background directly rather than through
+        # _start_session_processing, so it must perform that ownership handoff
+        # itself; without it, every completed packet leaves a permanent lock.
+        owner_task = asyncio.current_task()
+        session_tasks = getattr(adapter, "_session_tasks", None)
+        if owner_task is not None and isinstance(session_tasks, dict):
+            session_tasks[session_key] = owner_task
 
         logger.info(
             "HermesJobsWorker (%s) routing %s through interactive Telegram path (session_key=%s)",
@@ -1110,3 +1161,11 @@ class HermesJobsWorker:
                 await session_id_task
             except (asyncio.CancelledError, Exception):
                 pass
+            # Compatibility safety net: modern BasePlatformAdapter normally
+            # clears these in _process_message_background's owner-aware finally.
+            # Clear only entries we still own so a concurrent /new or queued
+            # handoff can never be erased by this unwind.
+            if adapter._active_sessions.get(session_key) is interrupt_event:
+                adapter._active_sessions.pop(session_key, None)
+            if isinstance(session_tasks, dict) and session_tasks.get(session_key) is owner_task:
+                session_tasks.pop(session_key, None)
