@@ -9796,10 +9796,11 @@ const groupChatMainTabs = new Map()
 
 function closeGroupChatMainTab(group) {
   const close = groupChatMainTabs.get(group)
+  const wasSelected = $groupChatWorkspace.get() === group
 
   groupChatMainTabs.delete(group)
 
-  if ($groupChatWorkspace.get() === group) {
+  if (wasSelected) {
     $groupChatWorkspace.set(null)
   }
 
@@ -9809,6 +9810,10 @@ function closeGroupChatMainTab(group) {
     } catch {
       /* tab already gone */
     }
+  }
+
+  if (wasSelected && typeof host.showChatWorkspace === 'function') {
+    host.showChatWorkspace()
   }
 }
 
@@ -9848,9 +9853,11 @@ function openGroupChat(group) {
         render: () => jsx(GroupChatMainView, { group }),
         onClose: () => {
           groupChatMainTabs.delete(group)
+          const wasSelected = $groupChatWorkspace.get() === group
 
-          if ($groupChatWorkspace.get() === group) {
+          if (wasSelected) {
             $groupChatWorkspace.set(null)
+            if (typeof host.showChatWorkspace === 'function') host.showChatWorkspace()
           }
         }
       })

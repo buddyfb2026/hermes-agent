@@ -4,6 +4,7 @@ import test from 'node:test'
 import vm from 'node:vm'
 
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
+const sdkSource = readFileSync(new URL('../../../sdk/index.ts', import.meta.url), 'utf8')
 
 /** Load the plugin in a vm with a scripted cli.exec so member turns are
  *  deterministic. `turnScript(profile, prompt)` returns the member's reply
@@ -355,10 +356,18 @@ test('source contract: workspace + main-window door + prompt rules are wired', (
   assert.match(pluginSource, /\[Group chat: "\$\{groupName\}"\]/)
 })
 
+test('Back and Bot exits explicitly re-front the canonical chat workspace', () => {
+  assert.match(sdkSource, /showChatWorkspace:\s*\(\): void => \{\s*revealTreePane\('workspace'\)/)
+  assert.match(pluginSource, /onBack: \(\) => closeGroupChatMainTab\(group\)/)
+  assert.match(pluginSource, /wasSelected && typeof host\.showChatWorkspace === 'function'/)
+})
+
 test('group selection follows main-window open and close', () => {
   const gc = load(() => '(pass)')
   let onClose
+  let fronted = 0
 
+  gc.host.showChatWorkspace = () => { fronted += 1 }
   gc.host.openWorkspace = (_id, options) => {
     onClose = options.onClose
     return () => onClose()
@@ -369,11 +378,14 @@ test('group selection follows main-window open and close', () => {
 
   onClose()
   assert.equal(gc.$groupChatWorkspace.get(), null)
+  assert.equal(fronted, 1)
 })
 
 test('Bot-row navigation closes the selected group main tab before opening chat', () => {
   const gc = load(() => '(pass)')
   let closed = 0
+  let fronted = 0
+  gc.host.showChatWorkspace = () => { fronted += 1 }
   gc.host.openWorkspace = (_id, options) => () => {
     closed += 1
     options.onClose()
@@ -383,23 +395,28 @@ test('Bot-row navigation closes the selected group main tab before opening chat'
   assert.equal(gc.$groupChatWorkspace.get(), 'BIZ-9999')
   gc.leaveGroupChatForBot()
   assert.equal(closed, 1)
+  assert.equal(fronted, 1)
   assert.equal(gc.$groupChatWorkspace.get(), null)
 
   // Idempotent after the tab is gone; a fast double-click cannot close twice.
   gc.leaveGroupChatForBot()
   assert.equal(closed, 1)
+  assert.equal(fronted, 1)
   assert.match(pluginSource, /haptic\('tap'\)\s+leaveGroupChatForBot\(\)\s+\$selectedBot\.set/)
 })
 
-test('closing an older selected group does not clear the newer selection', () => {
+test('closing an older selected group does not clear or re-front over the newer selection', () => {
   const gc = load(() => '(pass)')
+  let fronted = 0
 
+  gc.host.showChatWorkspace = () => { fronted += 1 }
   gc.host.openWorkspace = () => () => undefined
   gc.openGroupChat('Core')
   gc.openGroupChat('Ops')
   gc.closeGroupChatMainTab('Core')
 
   assert.equal(gc.$groupChatWorkspace.get(), 'Ops')
+  assert.equal(fronted, 0)
 })
 
 test('source contract: active group styling suppresses bot styling', () => {

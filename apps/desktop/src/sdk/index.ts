@@ -652,6 +652,14 @@ export const host = {
     return close
   },
 
+  /** Re-front the canonical main chat workspace after a plugin workspace
+   * closes. Removing an active contributed tab updates the tree but does not
+   * guarantee which surviving tab becomes active; observer/group surfaces use
+   * this explicit door instead of relying on neighbor-selection luck. */
+  showChatWorkspace: (): void => {
+    revealTreePane('workspace')
+  },
+
   /** Start a fresh chat draft, optionally pointed at another profile (its
    *  backend spins up in the background — same door the sidebar's per-profile
    *  "+" uses). */
