@@ -121,6 +121,27 @@ test('retry preserves prior member and seats the new claiming Avenger', async ()
   assert.equal(room.automation.cursor, 2)
 })
 
+test('claim-only retries prune false Avenger members but preserve authoritative authors', async () => {
+  const { api, rooms } = runtime([
+    { expectedOffset: 5, next_offset: 5, messages: [] },
+    { expectedOffset: 5, next_offset: 5, messages: [] }
+  ])
+  await api.syncLinearIssueRoom({
+    ...base,
+    members: [
+      { profile: 'hermes3', callsign: 'Captain America' },
+      { profile: 'hermes4', callsign: 'Black Widow' },
+      { profile: 'hermes5', callsign: 'Spiderman' }
+    ]
+  })
+  await api.syncLinearIssueRoom({
+    ...base,
+    members: [{ profile: 'hermes3', callsign: 'Captain America' }],
+    authoring: { ...base.authoring, profile: 'hermes4', callsign: 'Black Widow', status: 'claimed' }
+  })
+  assert.deepEqual(JSON.parse(JSON.stringify(rooms()['BIZ-9999'].members.map(member => member.name))), ['hermes3'])
+})
+
 test('archived lifecycle hides the active room without deleting its history', async () => {
   const { api, rooms } = runtime([{ expectedOffset: 5, next_offset: 5, messages: [] }])
   await api.syncLinearIssueRoom({ ...base, room_state: 'archived' })

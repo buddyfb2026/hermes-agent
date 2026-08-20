@@ -4449,16 +4449,20 @@ async function syncLinearIssueRoom(record) {
   const desiredMembers = (record.members || []).map(joined => issueRoomMember(joined.profile, joined.callsign))
   if (status === 'authoring' && !desiredMembers.some(candidate => candidate.name === member.name)) desiredMembers.push(member)
   const currentMembers = Array.isArray(existing.members) ? existing.members : []
+  const desiredNames = new Set(desiredMembers.map(candidate => candidate.name))
   const sessionId = String(authoring.session_id || '')
   const needsRoomUpdate = isNewJob
     || existing?.lifecycle?.state !== roomState
     || desiredMembers.some(desired => !currentMembers.some(current => current.name === desired.name))
+    || currentMembers.some(current => ISSUE_ROOM_AVENGER_PROFILES.has(current.name) && !desiredNames.has(current.name))
     || String(priorAutomation.session_id || '') !== sessionId
     || Number(priorAutomation.baseline) !== baseline
 
   if (needsRoomUpdate) {
     updateGroupChat(issueKey, room => {
-      const members = Array.isArray(room.members) ? [...room.members] : []
+      const members = (Array.isArray(room.members) ? room.members : []).filter(
+        candidate => !ISSUE_ROOM_AVENGER_PROFILES.has(candidate.name) || desiredNames.has(candidate.name)
+      )
       for (const descriptor of desiredMembers) {
         if (!members.some(candidate => candidate.name === descriptor.name)) members.push(descriptor)
       }
