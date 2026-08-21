@@ -5504,10 +5504,10 @@ function StudioFleetCodyMainView() {
   const state = useValue($studioFleetCody)
   const working = state.state === 'working'
   return jsxs('div', {
-    className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-editor)',
+    className: 'flex h-full min-h-0 flex-col overflow-hidden bg-(--ui-bg-editor)',
     children: [
       jsxs('div', {
-        className: 'border-b border-(--ui-stroke-secondary) px-4 py-3',
+        className: 'shrink-0 border-b border-(--ui-stroke-secondary) px-4 py-3',
         children: [
           jsxs('div', {
             className: 'flex items-center gap-2',
@@ -5524,7 +5524,7 @@ function StudioFleetCodyMainView() {
         ]
       }),
       jsxs('div', {
-        className: 'min-h-0 flex-1 overflow-auto px-4 py-4',
+        className: 'min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain px-4 py-4',
         children: [
           jsxs('div', {
             className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) p-3 shadow-sm',
@@ -5552,7 +5552,7 @@ function StudioFleetCodyMainView() {
         ]
       }),
       jsxs('div', {
-        className: 'flex items-center justify-between border-t border-(--ui-stroke-secondary) px-4 py-2 text-[0.625rem] text-(--ui-text-quaternary)',
+        className: 'flex shrink-0 items-center justify-between border-t border-(--ui-stroke-secondary) px-4 py-2 text-[0.625rem] text-(--ui-text-quaternary)',
         children: [
           jsx('span', { children: state.lastOutputAt ? `Last output ${relativeTime(state.lastOutputAt)}` : 'Waiting for first output' }),
           jsx('span', { className: 'font-mono', children: `${state.logBytes || 0} chars · polling 2.5s` })
@@ -5606,10 +5606,10 @@ function CcdMainView() {
     ? `${state.issueKey}${state.packetVersion ? ` · packet v${state.packetVersion}` : ''}`
     : 'No packet active'
   return jsxs('div', {
-    className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-editor)',
+    className: 'flex h-full min-h-0 flex-col overflow-hidden bg-(--ui-bg-editor)',
     children: [
       jsxs('div', {
-        className: 'border-b border-(--ui-stroke-secondary) px-4 py-3',
+        className: 'shrink-0 border-b border-(--ui-stroke-secondary) px-4 py-3',
         children: [
           jsxs('div', {
             className: 'flex items-center gap-2',
@@ -5626,7 +5626,7 @@ function CcdMainView() {
         ]
       }),
       jsxs('div', {
-        className: 'min-h-0 flex-1 overflow-auto px-4 py-4',
+        className: 'min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain px-4 py-4',
         children: [
           jsxs('div', {
             className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) p-3 shadow-sm',
@@ -5654,7 +5654,7 @@ function CcdMainView() {
         ]
       }),
       jsxs('div', {
-        className: 'flex items-center justify-between border-t border-(--ui-stroke-secondary) px-4 py-2 text-[0.625rem] text-(--ui-text-quaternary)',
+        className: 'flex shrink-0 items-center justify-between border-t border-(--ui-stroke-secondary) px-4 py-2 text-[0.625rem] text-(--ui-text-quaternary)',
         children: [
           jsx('span', { children: state.lastOutputAt ? `Last output ${relativeTime(state.lastOutputAt * 1000)}` : 'Waiting for output' }),
           jsx('span', { className: 'font-mono', children: `${state.tmuxTarget} · polling 2s` })
