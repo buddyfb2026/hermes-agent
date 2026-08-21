@@ -5949,11 +5949,12 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     }
     closeCcdWorkspace()
 
-    // While the real Studio Fleet harness owns Cody's active task, selecting
-    // the existing Cody row opens a read-only live work surface in the center.
-    // Any other Bot selection (or Cody while idle) closes that surface, so it
-    // never persists across unrelated chats.
-    const codyWorkVisible = isStudioFleetCody && ['working', 'queued'].includes(studioFleetCody.state)
+    // Cody's surface is both live work AND retained daily history. Keep it
+    // reachable after the lane goes idle whenever Studio Fleet still has jobs
+    // from today; selecting any unrelated Bot still closes it.
+    const codyWorkVisible = isStudioFleetCody && (
+      ['working', 'queued'].includes(studioFleetCody.state) || studioFleetCody.history?.length > 0
+    )
     if (!codyWorkVisible) {
       closeStudioFleetCodyWorkspace()
     } else if (openStudioFleetCodyWorkspace()) {
