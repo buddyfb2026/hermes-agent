@@ -225,12 +225,19 @@ function studioFleetResult(text, stage) {
 let studioFleetHistoryRefreshAt = 0
 let studioFleetHistoryCache = []
 
+function studioFleetLocalDay(date = new Date()) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
 async function refreshStudioFleetHistory(force = false) {
   const now = Date.now()
   if (!force && now - studioFleetHistoryRefreshAt < 15_000) return studioFleetHistoryCache
   const stages = ['active', 'done', 'bounced']
   const stageLists = await Promise.all(stages.map(stage => studioFleetListBriefs(stage)))
-  const today = new Date().toISOString().slice(0, 10)
+  const today = studioFleetLocalDay()
   const jobs = []
   for (let index = 0; index < stages.length; index += 1) {
     const stage = stages[index]

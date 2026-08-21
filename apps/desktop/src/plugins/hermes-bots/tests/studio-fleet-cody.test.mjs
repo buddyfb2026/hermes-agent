@@ -24,7 +24,7 @@ function runtime(desktop) {
     window: { hermesDesktop: desktop }
   }
   vm.createContext(context)
-  vm.runInContext(`${slice}\nglobalThis.__test = { $studioFleetCody, refreshStudioFleetCody, refreshStudioFleetHistory, studioFleetFrontmatter, studioFleetIssueKey, studioFleetProgress, studioFleetResult }`, context)
+  vm.runInContext(`${slice}\nglobalThis.__test = { $studioFleetCody, refreshStudioFleetCody, refreshStudioFleetHistory, studioFleetFrontmatter, studioFleetIssueKey, studioFleetProgress, studioFleetResult, studioFleetLocalDay }`, context)
   return context.__test
 }
 
@@ -67,7 +67,7 @@ test('real Cody activity overlays the existing profile with issue and checklist 
 })
 
 test('today history preserves one thread per active, done, and bounced job', async () => {
-  const today = new Date().toISOString().slice(0, 10)
+  const today = runtime({}).studioFleetLocalDay(new Date())
   const records = {
     '/active/live.md': `---\nid: live\ncreated: ${today}T10:00:00Z\nlinear: BIZ-1\ntitle: Live job\n---`,
     '/done/good.md': `---\nid: good\ncreated: ${today}T09:00:00Z\nlinear: BIZ-2\ntitle: Good job\n---\n- **outcome:** \`done\`\n- **acceptance:** 2/2 passed`,
@@ -95,6 +95,12 @@ test('today history preserves one thread per active, done, and bounced job', asy
   ])
   assert.equal(history[0].issueKey, 'BIZ-1')
   assert.equal(history[1].result.acceptance, '2/2 passed')
+})
+
+test('today follows the Mac local calendar after UTC midnight', () => {
+  const api = runtime({})
+  const lateLocal = new Date(2026, 7, 21, 21, 43, 0)
+  assert.equal(api.studioFleetLocalDay(lateLocal), '2026-08-21')
 })
 
 test('issue-room routing uses only the explicit trigger-neutral linear field', () => {
