@@ -888,6 +888,8 @@ test('threads: hydration assigns legacy thread ids — lull splits, follow-ups s
 test('source contract: thread UI — folded rows, per-thread reply box, new-thread composer', () => {
   assert.match(pluginSource, /Open this thread/)
   assert.match(pluginSource, /Collapse thread/)
+  assert.match(pluginSource, /Every member thread is user-collapsible, including the newest one/)
+  assert.doesNotMatch(pluginSource, /if \(!isNewest \|\| openThreads\[id\] !== undefined\)/)
   assert.match(pluginSource, /Reply in thread…/)
   assert.match(pluginSource, /children: 'New Thread'/)
   assert.match(pluginSource, /const markKey = `\$\{thread\}::\$\{memberKey\}`/)

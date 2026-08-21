@@ -10403,18 +10403,19 @@ function GroupChatWorkspace({ group, members, onBack }) {
     // and its own reply box (Slack's "reply in thread").
     const threadRows = []
 
-    if (!isNewest || openThreads[id] !== undefined) {
-      threadRows.push(
-        jsxs('button', {
-          type: 'button',
-          className:
-            'flex w-full items-center gap-1.5 px-2 pt-1 text-left text-[0.65rem] text-(--ui-text-quaternary) transition-colors hover:text-foreground',
-          title: 'Collapse this thread',
-          onClick: () => setOpenThreads(prev => ({ ...prev, [id]: false })),
-          children: [jsx(Codicon, { name: 'chevron-down', className: 'text-[0.6rem]' }), 'Collapse thread']
-        }, `unfold:${id}`)
-      )
-    }
+    // Every member thread is user-collapsible, including the newest one. The
+    // newest still defaults open, but it must not become an uncloseable wall of
+    // Avenger tool activity merely because it received the latest event.
+    threadRows.push(
+      jsxs('button', {
+        type: 'button',
+        className:
+          'flex w-full items-center gap-1.5 px-2 pt-1 text-left text-[0.65rem] text-(--ui-text-quaternary) transition-colors hover:text-foreground',
+        title: 'Collapse this thread',
+        onClick: () => setOpenThreads(prev => ({ ...prev, [id]: false })),
+        children: [jsx(Codicon, { name: 'chevron-down', className: 'text-[0.6rem]' }), 'Collapse thread']
+      }, `unfold:${id}`)
+    )
 
     for (const { entry, index } of entries) {
       threadRows.push(renderEntry(entry, index))
