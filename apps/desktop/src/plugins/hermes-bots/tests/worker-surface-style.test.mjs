@@ -11,15 +11,22 @@ function between(start, end) {
   return source.slice(from, to)
 }
 
-test('Cody workspace uses neutral elevated cards and a left-aligned code log', () => {
+test('Cody workspace renders a scrollable threaded daily history', () => {
   const view = between('function StudioFleetCodyMainView()', 'function closeStudioFleetCodyWorkspace')
+  const thread = between('function CodyJobThread', 'function StudioFleetCodyMainView()')
   assert.match(view, /bg-\(--ui-bg-editor\)/)
-  assert.match(view, /bg-\(--ui-bg-elevated\)/)
-  assert.match(view, /font-mono text-\[0\.75rem\]/)
-  assert.match(view, /break-words text-left/)
+  assert.match(view, /Today’s work/)
+  assert.match(view, /visibleHistory\.map/)
+  assert.match(view, /hidden · Restore/)
   assert.match(view, /flex h-full min-h-0 flex-col overflow-hidden/)
   assert.match(view, /min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain/)
   assert.match(view, /flex shrink-0 items-center justify-between/)
+  assert.match(thread, /bg-\(--ui-bg-elevated\)/)
+  assert.match(thread, /font-mono text-\[0\.75rem\]/)
+  assert.match(thread, /break-words whitespace-pre-wrap text-left/)
+  assert.match(thread, /aria-expanded/)
+  assert.match(thread, /onDismiss\(job\.id\)/)
+  assert.match(thread, /Hide this job from today’s view/)
   assert.doesNotMatch(view, /bg-\(--ui-bg-secondary\)/)
 })
 

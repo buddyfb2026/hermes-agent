@@ -24,7 +24,7 @@ function runtime(desktop) {
     window: { hermesDesktop: desktop }
   }
   vm.createContext(context)
-  vm.runInContext(`${slice}\nglobalThis.__test = { $studioFleetCody, refreshStudioFleetCody, studioFleetFrontmatter, studioFleetIssueKey, studioFleetProgress }`, context)
+  vm.runInContext(`${slice}\nglobalThis.__test = { $studioFleetCody, refreshStudioFleetCody, refreshStudioFleetHistory, studioFleetFrontmatter, studioFleetIssueKey, studioFleetProgress, studioFleetResult }`, context)
   return context.__test
 }
 
@@ -32,7 +32,7 @@ test('real Cody activity overlays the existing profile with issue and checklist 
   const desktop = {
     async readDir(path) {
       if (path.endsWith('/active')) return { entries: [{ isDirectory: false, name: 'build-map.md', path: '/active/build-map.md' }] }
-      if (path.endsWith('/pending')) return { entries: [] }
+      if (path.endsWith('/pending') || path.endsWith('/done') || path.endsWith('/bounced')) return { entries: [] }
       throw new Error(`unexpected dir ${path}`)
     },
     async readFileText(path) {
@@ -61,8 +61,40 @@ test('real Cody activity overlays the existing profile with issue and checklist 
     worktree: '/Users/buddystudio1/CodyWork/build-map',
     logBytes: '• inspect files\n✓ migration complete\n→ running tests'.length,
     lastOutputAt: api.$studioFleetCody.get().lastOutputAt,
+    history: [],
     refreshedAt: api.$studioFleetCody.get().refreshedAt
   })
+})
+
+test('today history preserves one thread per active, done, and bounced job', async () => {
+  const today = new Date().toISOString().slice(0, 10)
+  const records = {
+    '/active/live.md': `---\nid: live\ncreated: ${today}T10:00:00Z\nlinear: BIZ-1\ntitle: Live job\n---`,
+    '/done/good.md': `---\nid: good\ncreated: ${today}T09:00:00Z\nlinear: BIZ-2\ntitle: Good job\n---\n- **outcome:** \`done\`\n- **acceptance:** 2/2 passed`,
+    '/bounced/bad.md': `---\nid: bad\ncreated: ${today}T08:00:00Z\ntitle: Bad job\n---\n- **outcome:** \`bounced\` (\`timeout\`)`
+  }
+  const api = runtime({
+    async readDir(path) {
+      const stage = path.split('/').at(-1)
+      if (stage === 'pending') return { entries: [] }
+      const ids = stage === 'active' ? ['live'] : stage === 'done' ? ['good'] : stage === 'bounced' ? ['bad'] : []
+      return { entries: ids.map(id => ({ isDirectory: false, name: `${id}.md`, path: `/${stage}/${id}.md` })) }
+    },
+    async readFileText(path) {
+      if (records[path]) return { text: records[path] }
+      if (path.endsWith('.codex.log')) return { text: `output for ${path}` }
+      throw new Error(`unexpected file ${path}`)
+    }
+  })
+  await api.refreshStudioFleetCody()
+  const history = JSON.parse(JSON.stringify(api.$studioFleetCody.get().history))
+  assert.deepEqual(history.map(job => [job.id, job.stage, job.result.outcome]), [
+    ['live', 'active', 'active'],
+    ['good', 'done', 'done'],
+    ['bad', 'bounced', 'bounced']
+  ])
+  assert.equal(history[0].issueKey, 'BIZ-1')
+  assert.equal(history[1].result.acceptance, '2/2 passed')
 })
 
 test('issue-room routing uses only the explicit trigger-neutral linear field', () => {

@@ -130,8 +130,24 @@ const $studioFleetCody = atom({
   worktree: '',
   logBytes: 0,
   lastOutputAt: 0,
+  history: [],
   refreshedAt: 0
 })
+const $dismissedCodyJobs = atom([])
+
+function setDismissedCodyJobs(ids) {
+  const next = [...new Set((ids || []).map(id => String(id || '').trim()).filter(Boolean))]
+  $dismissedCodyJobs.set(next)
+  try { Promise.resolve(pluginCtx?.storage?.set?.('cody-dismissed-jobs', next)).catch(() => undefined) } catch { /* window-only fallback */ }
+}
+
+function dismissCodyJob(id) {
+  setDismissedCodyJobs([...$dismissedCodyJobs.get(), id])
+}
+
+function restoreCodyJobs() {
+  setDismissedCodyJobs([])
+}
 
 async function studioFleetReadText(path) {
   const desktop = typeof window !== 'undefined' ? window.hermesDesktop : null
@@ -186,6 +202,69 @@ function studioFleetTranscriptTail(text) {
     .map(line => (line.length > 260 ? `${line.slice(0, 259)}…` : line))
 }
 
+function studioFleetHistoryLines(text) {
+  const lines = String(text || '')
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter(line => line.trim())
+  const omitted = Math.max(0, lines.length - 320)
+  const visible = lines.slice(-320).map(line => (line.length > 500 ? `${line.slice(0, 499)}…` : line))
+  return omitted ? [`… ${omitted} earlier transcript lines omitted — use Reveal transcript for the complete log …`, ...visible] : visible
+}
+
+function studioFleetResult(text, stage) {
+  const source = String(text || '')
+  const outcome = source.match(/^- \*\*outcome:\*\*\s*`?([^`\n(]+).*$/m)?.[1]?.trim() || stage
+  const attempt = source.match(/^- \*\*attempt:\*\*\s*([^\n]+)$/m)?.[1]?.trim() || ''
+  const pr = source.match(/^- \*\*PR:\*\*\s*(\S+)/m)?.[1] || ''
+  const commit = source.match(/^- \*\*commit:\*\*\s*`?([^`\n]+).*$/m)?.[1]?.trim() || ''
+  const acceptance = source.match(/^- \*\*acceptance:\*\*\s*([^\n]+)$/m)?.[1]?.trim() || ''
+  return { outcome, attempt, pr, commit, acceptance }
+}
+
+let studioFleetHistoryRefreshAt = 0
+let studioFleetHistoryCache = []
+
+async function refreshStudioFleetHistory(force = false) {
+  const now = Date.now()
+  if (!force && now - studioFleetHistoryRefreshAt < 15_000) return studioFleetHistoryCache
+  const stages = ['active', 'done', 'bounced']
+  const stageLists = await Promise.all(stages.map(stage => studioFleetListBriefs(stage)))
+  const today = new Date().toISOString().slice(0, 10)
+  const jobs = []
+  for (let index = 0; index < stages.length; index += 1) {
+    const stage = stages[index]
+    for (const task of stageLists[index]) {
+      try {
+        const brief = await studioFleetReadText(task.path)
+        const meta = studioFleetFrontmatter(brief)
+        const result = studioFleetResult(brief, stage)
+        if (!String(meta.created || '').startsWith(today) && !result.attempt.includes(today)) continue
+        let log = ''
+        try { log = await studioFleetReadText(`${STUDIO_FLEET_LOGS}/${task.id}.codex.log`) } catch { /* claim may precede log */ }
+        jobs.push({
+          id: task.id,
+          stage,
+          title: meta.title || task.id,
+          issueKey: studioFleetIssueKey(meta),
+          created: meta.created || '',
+          sourcePath: task.path,
+          logPath: `${STUDIO_FLEET_LOGS}/${task.id}.codex.log`,
+          worktree: `/Users/buddystudio1/CodyWork/${task.id}`,
+          lines: studioFleetHistoryLines(log),
+          logBytes: log.length,
+          result
+        })
+      } catch { /* one malformed record must not hide the other jobs */ }
+    }
+  }
+  const rank = { active: 0, done: 1, bounced: 2 }
+  jobs.sort((a, b) => (rank[a.stage] - rank[b.stage]) || String(b.created).localeCompare(String(a.created)) || a.id.localeCompare(b.id))
+  studioFleetHistoryCache = jobs
+  studioFleetHistoryRefreshAt = now
+  return jobs
+}
+
 function studioFleetProgress(text) {
   const checklist = studioFleetChecklistLines(text)
   const raw = checklist.at(-1) || ''
@@ -197,7 +276,11 @@ let studioFleetLogChangedAt = 0
 
 async function refreshStudioFleetCody() {
   try {
-    const [active, pending] = await Promise.all([studioFleetListBriefs('active'), studioFleetListBriefs('pending')])
+    const [active, pending, history] = await Promise.all([
+      studioFleetListBriefs('active'),
+      studioFleetListBriefs('pending'),
+      refreshStudioFleetHistory()
+    ])
     const task = active[0] || null
     if (!task) {
       const previous = $studioFleetCody.get()
@@ -211,7 +294,7 @@ async function refreshStudioFleetCody() {
       }
       const terminal = previous.state === 'working' && previous.jobId
       const state = terminal
-        ? { ...previous, state: 'idle', preview: '', refreshedAt: Date.now() }
+        ? { ...previous, state: 'idle', preview: '', history, refreshedAt: Date.now() }
         : {
             state: pending.length ? 'queued' : 'idle',
             preview: pending.length ? `${pending.length} validated brief${pending.length === 1 ? '' : 's'} queued` : '',
@@ -226,6 +309,7 @@ async function refreshStudioFleetCody() {
             worktree: '',
             logBytes: 0,
             lastOutputAt: 0,
+            history,
             refreshedAt: Date.now()
           }
       $studioFleetCody.set(state)
@@ -265,6 +349,7 @@ async function refreshStudioFleetCody() {
       worktree: `/Users/buddystudio1/CodyWork/${task.id}`,
       logBytes: log.length,
       lastOutputAt: studioFleetLogChangedAt,
+      history,
       refreshedAt: Date.now()
     }
     $studioFleetCody.set(state)
@@ -5500,9 +5585,85 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
 
 let studioFleetCodyWorkspaceClose = null
 
+function CodyJobThread({ job, onDismiss }) {
+  const [expanded, setExpanded] = useState(job.stage === 'active')
+  useEffect(() => {
+    if (job.stage === 'active') setExpanded(true)
+  }, [job.stage])
+  const tone = job.stage === 'active'
+    ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+    : job.stage === 'done'
+      ? 'bg-sky-500/15 text-sky-700 dark:text-sky-300'
+      : 'bg-red-500/15 text-red-700 dark:text-red-300'
+  const label = job.stage === 'active' ? 'working' : job.result?.outcome || job.stage
+  return jsxs('section', {
+    className: 'overflow-hidden rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) shadow-sm',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center border-b border-transparent',
+        children: [
+          jsxs('button', {
+            type: 'button',
+            className: 'flex min-w-0 flex-1 items-center gap-3 px-3 py-3 text-left hover:bg-(--chrome-action-hover)',
+            onClick: () => setExpanded(!expanded),
+            'aria-expanded': expanded,
+            children: [
+              jsx(Codicon, { name: expanded ? 'chevron-down' : 'chevron-right', className: 'shrink-0 text-(--ui-text-tertiary)' }),
+              jsxs('div', {
+                className: 'min-w-0 flex-1',
+                children: [
+                  jsx('div', { className: 'truncate text-sm font-semibold text-foreground', children: job.title }),
+                  jsx('div', { className: 'mt-0.5 truncate font-mono text-[0.6875rem] text-(--ui-text-tertiary)', children: [job.issueKey || job.id, job.issueKey ? ` · ${job.id}` : ''] })
+                ]
+              }),
+              jsx('span', { className: cn('shrink-0 rounded-full px-2 py-0.5 text-[0.625rem] font-semibold uppercase tracking-wide', tone), children: label })
+            ]
+          }),
+          jsx('button', {
+            type: 'button',
+            className: 'mr-2 flex size-7 shrink-0 items-center justify-center rounded-md text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground',
+            'aria-label': `Hide ${job.title}`,
+            title: 'Hide this job from today’s view',
+            onClick: () => onDismiss(job.id),
+            children: jsx(Codicon, { name: 'close' })
+          })
+        ]
+      }),
+      expanded
+        ? jsxs('div', {
+            className: 'border-t border-(--ui-stroke-secondary) px-3 pb-3 pt-3',
+            children: [
+              job.result?.attempt ? jsx('div', { className: 'mb-2 text-xs text-(--ui-text-tertiary)', children: job.result.attempt }) : null,
+              job.result?.acceptance ? jsx('div', { className: 'mb-2 text-xs text-(--ui-text-primary)', children: `Acceptance: ${job.result.acceptance}` }) : null,
+              job.result?.commit ? jsx('div', { className: 'mb-2 font-mono text-[0.6875rem] text-(--ui-text-tertiary)', children: `Commit: ${job.result.commit}` }) : null,
+              jsxs('div', {
+                className: 'mb-3 flex flex-wrap gap-2',
+                children: [
+                  jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => pluginCtx?.os?.revealPath?.(job.worktree), children: 'Open worktree' }),
+                  jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => pluginCtx?.os?.revealPath?.(job.logPath), children: 'Reveal transcript' }),
+                  jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => pluginCtx?.os?.revealPath?.(job.sourcePath), children: 'Reveal brief' })
+                ]
+              }),
+              job.lines?.length
+                ? jsx('div', {
+                    className: 'max-h-[34rem] overflow-x-hidden overflow-y-auto overscroll-contain rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-editor) p-3 font-mono text-[0.75rem] leading-5 text-(--ui-text-primary)',
+                    children: job.lines.map((line, index) => jsx('div', { className: 'break-words whitespace-pre-wrap text-left', children: line }, `${job.id}:${index}`))
+                  })
+                : jsx('p', { className: 'text-xs text-(--ui-text-tertiary)', children: 'No Codex transcript was written for this job.' }),
+              jsx('div', { className: 'mt-2 text-[0.625rem] text-(--ui-text-quaternary)', children: `${job.logBytes || 0} transcript chars` })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
 function StudioFleetCodyMainView() {
   const state = useValue($studioFleetCody)
+  const dismissed = useValue($dismissedCodyJobs)
   const working = state.state === 'working'
+  const history = Array.isArray(state.history) ? state.history : []
+  const visibleHistory = history.filter(job => !dismissed.includes(job.id))
   return jsxs('div', {
     className: 'flex h-full min-h-0 flex-col overflow-hidden bg-(--ui-bg-editor)',
     children: [
@@ -5527,28 +5688,28 @@ function StudioFleetCodyMainView() {
         className: 'min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain px-4 py-4',
         children: [
           jsxs('div', {
-            className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) p-3 shadow-sm',
+            className: 'mb-3 flex items-center justify-between gap-3',
             children: [
-              jsx('div', { className: 'text-sm font-semibold text-foreground', children: state.title || state.task || 'Cody is idle' }),
-              jsx('div', { className: 'mt-1 font-mono text-[0.6875rem] text-(--ui-text-tertiary)', children: [state.identity || '', state.task && state.identity !== state.task ? ` · ${state.task}` : ''] }),
-              working
-                ? jsxs('div', {
-                    className: 'mt-3 flex gap-2',
-                    children: [
-                      jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => pluginCtx?.os?.revealPath?.(state.worktree), children: 'Open worktree' }),
-                      jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => pluginCtx?.os?.revealPath?.(state.logPath), children: 'Reveal transcript' })
-                    ]
-                  })
+              jsxs('div', {
+                children: [
+                  jsx('div', { className: 'text-[0.6875rem] font-semibold uppercase tracking-[0.08em] text-(--ui-text-tertiary)', children: 'Today’s work' }),
+                  jsx('div', { className: 'mt-0.5 text-xs text-(--ui-text-quaternary)', children: `${history.length} job${history.length === 1 ? '' : 's'} retained by Studio Fleet` })
+                ]
+              }),
+              dismissed.length
+                ? jsx(Button, { size: 'sm', variant: 'ghost', onClick: restoreCodyJobs, children: `${dismissed.length} hidden · Restore` })
                 : null
             ]
           }),
-          jsx('div', { className: 'mt-4 text-[0.6875rem] font-semibold uppercase tracking-[0.08em] text-(--ui-text-tertiary)', children: 'Recent Codex output' }),
-          state.lines?.length
+          visibleHistory.length
             ? jsx('div', {
-              className: 'mt-2 space-y-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) p-4 font-mono text-[0.75rem] leading-5 text-(--ui-text-primary) shadow-sm',
-              children: state.lines.map((line, index) => jsx('div', { className: 'break-words text-left', children: line }, `${index}:${line}`))
+                className: 'space-y-3',
+                children: visibleHistory.map(job => jsx(CodyJobThread, { job, onDismiss: dismissCodyJob }, job.id))
               })
-            : jsx('p', { className: 'mt-2 text-xs text-(--ui-text-tertiary)', children: working ? 'Cody claimed the brief; waiting for the Codex transcript…' : 'No Studio Fleet task is active.' })
+            : jsx('div', {
+                className: 'rounded-lg border border-dashed border-(--ui-stroke-secondary) p-6 text-center text-xs text-(--ui-text-tertiary)',
+                children: history.length ? 'All of today’s Cody jobs are hidden. Use Restore above to bring them back.' : 'No Studio Fleet jobs were recorded today.'
+              })
         ]
       }),
       jsxs('div', {
@@ -11203,6 +11364,18 @@ export default {
         .catch(() => undefined)
     } catch {
       /* no storage — default (silent) stays */
+    }
+
+    // Hydrate Cody thread dismissals. This is presentation-only; queue records,
+    // logs, worktrees and issue-room evidence remain authoritative and untouched.
+    try {
+      Promise.resolve(ctx.storage?.get?.('cody-dismissed-jobs'))
+        .then(value => {
+          if (Array.isArray(value)) $dismissedCodyJobs.set([...new Set(value.map(String).filter(Boolean))])
+        })
+        .catch(() => undefined)
+    } catch {
+      /* no storage — all retained jobs remain visible */
     }
 
     // Hydrate persisted group-chat room logs (epoch/running are runtime-only
