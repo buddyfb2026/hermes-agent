@@ -5592,6 +5592,22 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
 
 let studioFleetCodyWorkspaceClose = null
 
+async function openCodyConversation() {
+  // Studio Fleet keeps working independently; this changes only the center
+  // surface. Resume Cody's canonical conversational session rather than
+  // creating a second chat or sending anything into the hardened harness.
+  closeStudioFleetCodyWorkspace()
+  $selectedBot.set('cody')
+  const bot = $lastRoster.get().find(candidate => !candidate.remoteSource && candidate.name === 'cody')
+  const pinned = $botMeta.get().cody?.chat
+  try {
+    const opened = await openBotCanonicalChat('cody', pinned, bot?.preferred_session || bot?.last_session)
+    if (!opened && typeof host.newChat === 'function') host.newChat('cody')
+  } catch (error) {
+    host.notifyError?.(error, 'Could not open Cody’s chat')
+  }
+}
+
 function CodyJobThread({ job, onDismiss }) {
   const [expanded, setExpanded] = useState(job.stage === 'active')
   useEffect(() => {
@@ -5682,7 +5698,8 @@ function StudioFleetCodyMainView() {
             children: [
               jsx('span', { className: cn('size-2 rounded-full', working ? 'bg-emerald-500' : 'bg-(--ui-text-quaternary)') }),
               jsx('strong', { className: 'text-sm text-foreground', children: 'Cody · Studio Fleet' }),
-              jsx('span', { className: 'text-xs text-(--ui-text-tertiary)', children: working ? 'Working' : state.state })
+              jsx('span', { className: 'text-xs text-(--ui-text-tertiary)', children: working ? 'Working' : state.state }),
+              jsx(Button, { size: 'sm', variant: 'secondary', className: 'ml-auto', onClick: openCodyConversation, children: 'Chat with Cody' })
             ]
           }),
           jsx('p', {

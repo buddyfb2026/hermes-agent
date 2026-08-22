@@ -16,6 +16,8 @@ test('Cody workspace renders a scrollable threaded daily history', () => {
   const thread = between('function CodyJobThread', 'function StudioFleetCodyMainView()')
   assert.match(view, /bg-\(--ui-bg-editor\)/)
   assert.match(view, /Today’s work/)
+  assert.match(view, /Chat with Cody/)
+  assert.match(view, /onClick: openCodyConversation/)
   assert.match(view, /visibleHistory\.map/)
   assert.match(view, /hidden · Restore/)
   assert.match(view, /flex h-full min-h-0 flex-col overflow-hidden/)
