@@ -5956,12 +5956,10 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     }
     closeCcdWorkspace()
 
-    // Cody's surface is both live work AND retained daily history. Keep it
-    // reachable after the lane goes idle whenever Studio Fleet still has jobs
-    // from today; selecting any unrelated Bot still closes it.
-    const codyWorkVisible = isStudioFleetCody && (
-      ['working', 'queued'].includes(studioFleetCody.state) || studioFleetCody.history?.length > 0
-    )
+    // Live work owns the center only while Studio Fleet is active. Once idle,
+    // a normal Cody click returns to his conversational canonical Bot Chat;
+    // retained work stays available through the explicit context-menu action.
+    const codyWorkVisible = isStudioFleetCody && ['working', 'queued'].includes(studioFleetCody.state)
     if (!codyWorkVisible) {
       closeStudioFleetCodyWorkspace()
     } else if (openStudioFleetCodyWorkspace()) {
@@ -6194,6 +6192,15 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
             children: meta?.hidden ? 'Unhide Bot' : 'Hide Bot'
           }),
           jsx(ContextMenuSeparator, {}),
+          isStudioFleetCody && studioFleetCody.history?.length
+            ? jsx(ContextMenuItem, {
+                onSelect: () => {
+                  closeCcdWorkspace()
+                  openStudioFleetCodyWorkspace()
+                },
+                children: 'Today’s work'
+              })
+            : null,
           jsx(ContextMenuItem, {
             onSelect: () => openBotSessionsWorkspace(bot),
             children: 'Sessions'
