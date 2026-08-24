@@ -659,6 +659,43 @@ class TestPacketAuthoringCompletionContract:
         assert not HermesJobsWorker._has_packet_completion_evidence(row, [created])
         assert HermesJobsWorker._has_packet_completion_evidence(row, [created, review])
 
+    async def test_rework_versions_above_three_are_corroborated(self):
+        """BIZ-1308 regression: the rework rule is 'not v1', never an enum.
+
+        A predicate matching only {2, 3} returns False for any higher version
+        no matter what evidence exists. Because missing evidence RELEASES the
+        row instead of failing it, such a job re-authors and releases forever.
+        BIZ-421 really ran at packet_version 4 (hermes_jobs, queued
+        2026-06-12), so this is a reachable strand, not a hypothetical.
+        """
+        for version in (4, 5, 12):
+            row = _row(packet_version=version)
+            resubmitted = {
+                "type": "packet_resubmitted",
+                "packet_version": version,
+                "issue_id": "iid",
+                "issue_key": "BIZ-208",
+                "created_at": "2026-08-24T12:00:01Z",
+            }
+
+            assert HermesJobsWorker._has_packet_completion_evidence(
+                row, [resubmitted]
+            ), f"v{version} rework evidence must corroborate"
+
+            # Still discriminating: evidence for a DIFFERENT version must not
+            # satisfy this run, or the fix would be a blanket accept.
+            wrong_version = dict(resubmitted, packet_version=version - 1)
+            assert not HermesJobsWorker._has_packet_completion_evidence(
+                row, [wrong_version]
+            ), f"v{version} must reject v{version - 1} evidence"
+
+            # And a v1-shaped pair must not satisfy a rework run either.
+            created = dict(resubmitted, type="packet_created")
+            review = dict(resubmitted, type="review_requested")
+            assert not HermesJobsWorker._has_packet_completion_evidence(
+                row, [created, review]
+            ), f"v{version} must require packet_resubmitted specifically"
+
     async def test_default_fetch_reads_canonical_events_from_central_db(self):
         pool = _FakePool(packet_event_rows=_valid_packet_events(None))
         worker = _make_worker(

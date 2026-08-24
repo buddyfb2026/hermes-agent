@@ -916,9 +916,19 @@ class HermesJobsWorker:
                 observed.add(event_type)
         if version == 1:
             return {"packet_created", "review_requested"}.issubset(observed)
-        if version in {2, 3}:
+        if version >= 2:
             # BIZ-176's CCD review emitter consumes packet_resubmitted itself;
             # canonical rework rows do not emit a second review_requested.
+            #
+            # BIZ-1308 review: this MUST NOT enumerate specific versions. An
+            # earlier form matched only {2, 3}, so any higher version fell
+            # through to the unconditional `return False` below and could never
+            # be corroborated — and because missing evidence RELEASES the row
+            # rather than failing it, such a job re-authored and released
+            # forever. That is reachable, not theoretical: BIZ-421 ran at
+            # packet_version 4 (hermes_jobs, queued 2026-06-12). The rework
+            # contract is "not v1", so bound it that way and it stays correct
+            # as the version ceiling moves.
             return "packet_resubmitted" in observed
         return False
 
