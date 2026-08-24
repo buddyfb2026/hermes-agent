@@ -60,9 +60,15 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
           # minimal config so serve cannot enter first-run interactive prompts
           Set-Content -Path "$env:HERMES_HOME\config.yaml" -Value "model:`n  provider: openrouter`n  model: test`n"
-          # hold 9119 exactly like the reporter did
-          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(300)" -PassThru
-          Start-Sleep -Seconds 3
+          # hold 9119 exactly like the reporter did (script file: Start-Process
+          # -ArgumentList mangles inline -c payloads with spaces/semicolons)
+          Set-Content -Path "$env:RUNNER_TEMP\holder.py" -Value "import socket, time`ns = socket.socket()`ns.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)`ns.bind(('127.0.0.1', 9119))`ns.listen(1)`nprint('HOLDING', flush=True)`ntime.sleep(300)"
+          $holder = Start-Process python -ArgumentList "$env:RUNNER_TEMP\holder.py" -RedirectStandardOutput "$env:RUNNER_TEMP\holder.log" -PassThru
+          Start-Sleep -Seconds 5
+          $held = (netstat -ano | Select-String ':9119 .*LISTENING')
+          Write-Host "holder log: $(Get-Content "$env:RUNNER_TEMP\holder.log" -Raw -ErrorAction SilentlyContinue)"
+          Write-Host "netstat: $held"
+          if (-not $held) { Write-Host "SETUP FAIL: holder is not listening on 9119"; exit 1 }
           # stdin from NUL (EOF for any unexpected prompt), output to files, bounded wait
           $p = Start-Process cmd -ArgumentList '/c', 'python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 < NUL > "%RUNNER_TEMP%\serve-conflict.log" 2>&1' -PassThru
           $deadline = (Get-Date).AddSeconds(240)
@@ -126,8 +132,10 @@ jobs:
           $env:HERMES_HOME = "$env:RUNNER_TEMP\hh-base"
           New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
           Set-Content -Path "$env:HERMES_HOME\config.yaml" -Value "model:`n  provider: openrouter`n  model: test`n"
-          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(300)" -PassThru
-          Start-Sleep -Seconds 3
+          $holder = Start-Process python -ArgumentList "$env:RUNNER_TEMP\holder.py" -RedirectStandardOutput "$env:RUNNER_TEMP\holder-base.log" -PassThru
+          Start-Sleep -Seconds 5
+          $held = (netstat -ano | Select-String ':9119 .*LISTENING')
+          if (-not $held) { Write-Host "SETUP FAIL: holder is not listening on 9119"; exit 1 }
           $p = Start-Process cmd -ArgumentList '/c', 'python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 < NUL > "%RUNNER_TEMP%\serve-base.log" 2>&1' -PassThru
           $deadline = (Get-Date).AddSeconds(240)
           while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
