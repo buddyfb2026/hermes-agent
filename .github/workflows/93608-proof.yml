@@ -38,31 +38,43 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: LEG 1 HEAD - serve sentinel fires on held port (reporter repro)
+        timeout-minutes: 8
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
           $env:HERMES_HOME = "$env:RUNNER_TEMP\hh-head"
           New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
+          # minimal config so serve cannot enter first-run interactive prompts
+          Set-Content -Path "$env:HERMES_HOME\config.yaml" -Value "model:`n  provider: openrouter`n  model: test`n"
           # hold 9119 exactly like the reporter did
-          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(120)" -PassThru
+          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(300)" -PassThru
           Start-Sleep -Seconds 3
-          $out = python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 2>&1 | Out-String
-          $code = $LASTEXITCODE
+          # stdin from NUL (EOF for any unexpected prompt), output to files, bounded wait
+          $p = Start-Process cmd -ArgumentList '/c', 'python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 < NUL > "%RUNNER_TEMP%\serve-conflict.log" 2>&1' -PassThru
+          $deadline = (Get-Date).AddSeconds(120)
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+          $timedOut = -not $p.HasExited
+          if ($timedOut) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
           Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue
-          Write-Host "exit=$code"
+          $out = Get-Content "$env:RUNNER_TEMP\serve-conflict.log" -Raw -ErrorAction SilentlyContinue
+          $code = $p.ExitCode
+          Write-Host "timedOut=$timedOut exit=$code"
           Write-Host $out
+          if ($timedOut) { Write-Host "FAIL: serve hung on held port"; exit 1 }
           if ($code -ne 75) { Write-Host "FAIL: expected exit 75, got $code"; exit 1 }
           if ($out -notmatch 'BACKEND_PORT_IN_USE port=9119') { Write-Host "FAIL: sentinel missing"; exit 1 }
           if ($out -match 'HERMES_BACKEND_READY') { Write-Host "FAIL: ready line on conflict"; exit 1 }
           Write-Host "PASS: head emits sentinel + exit 75"
 
       - name: LEG 2 HEAD - free port boots and announces ready
+        timeout-minutes: 8
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
           $env:HERMES_HOME = "$env:RUNNER_TEMP\hh-head2"
           New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
-          $p = Start-Process python -ArgumentList '-m','hermes_cli.main','serve','--host','127.0.0.1','--port','0' -RedirectStandardOutput "$env:RUNNER_TEMP\serve-free.log" -RedirectStandardError "$env:RUNNER_TEMP\serve-free.err" -PassThru
+          Set-Content -Path "$env:HERMES_HOME\config.yaml" -Value "model:`n  provider: openrouter`n  model: test`n"
+          $p = Start-Process cmd -ArgumentList '/c', 'python -m hermes_cli.main serve --host 127.0.0.1 --port 0 < NUL > "%RUNNER_TEMP%\serve-free.log" 2>&1' -PassThru
           $deadline = (Get-Date).AddSeconds(90)
           $ready = $false
           while ((Get-Date) -lt $deadline) {
@@ -73,13 +85,13 @@ jobs:
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           if (-not $ready) {
             Write-Host "FAIL: no ready line on free port"
-            Get-Content "$env:RUNNER_TEMP\serve-free.log" -ErrorAction SilentlyContinue | Select-Object -Last 20
-            Get-Content "$env:RUNNER_TEMP\serve-free.err" -ErrorAction SilentlyContinue | Select-Object -Last 20
+            Get-Content "$env:RUNNER_TEMP\serve-free.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
             exit 1
           }
           Write-Host "PASS: free port boots + HERMES_BACKEND_READY"
 
       - name: LEG 3 HEAD - claim degrades on probe failure with live child (real PowerShell)
+        timeout-minutes: 15
         shell: pwsh
         working-directory: apps/desktop
         run: |
@@ -90,6 +102,7 @@ jobs:
           Write-Host "PASS: head degrade + fail-closed + real-probe legs"
 
       - name: LEG 4 BASE - bug fires on merge-base (serve half)
+        timeout-minutes: 8
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
@@ -98,13 +111,20 @@ jobs:
           git checkout $base -- hermes_cli/web_server.py
           $env:HERMES_HOME = "$env:RUNNER_TEMP\hh-base"
           New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
-          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(120)" -PassThru
+          Set-Content -Path "$env:HERMES_HOME\config.yaml" -Value "model:`n  provider: openrouter`n  model: test`n"
+          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(300)" -PassThru
           Start-Sleep -Seconds 3
-          $out = python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 2>&1 | Out-String
-          $code = $LASTEXITCODE
+          $p = Start-Process cmd -ArgumentList '/c', 'python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 < NUL > "%RUNNER_TEMP%\serve-base.log" 2>&1' -PassThru
+          $deadline = (Get-Date).AddSeconds(120)
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+          $timedOut = -not $p.HasExited
+          if ($timedOut) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
           Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue
           git checkout HEAD -- hermes_cli/web_server.py
-          Write-Host "base exit=$code"
+          $out = Get-Content "$env:RUNNER_TEMP\serve-base.log" -Raw -ErrorAction SilentlyContinue
+          $code = $p.ExitCode
+          Write-Host "base timedOut=$timedOut exit=$code"
+          if ($timedOut) { Write-Host "FAIL: base serve hung (unexpected shape)"; exit 1 }
           if ($code -eq 75 -or $out -match 'BACKEND_PORT_IN_USE') { Write-Host "FAIL: base already has the fix?"; exit 1 }
           if ($code -ne 1) { Write-Host "WARN: base exit was $code (expected 1)"; }
           Write-Host "PASS: base shows bare bind failure (exit=$code, no sentinel) - bug fires"
