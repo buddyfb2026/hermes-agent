@@ -2048,6 +2048,11 @@ def _current_max_iterations() -> int:
         return 500
 
 
+def _startup_agent_max_iterations() -> int:
+    """Resolve the startup log budget through the execution-time resolver."""
+    return _current_max_iterations()
+
+
 from contextlib import contextmanager as _contextmanager
 
 
@@ -12236,7 +12241,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # config.yaml → env bridge did the right thing at a glance (instead
         # of silently running at a stale .env value for weeks).
         try:
-            _effective_max_iter = int(os.getenv("HERMES_MAX_ITERATIONS", "500"))
+            # Use the identical config-authoritative resolver called before
+            # each actual turn; direct env reads can advertise stale .env data.
+            _effective_max_iter = _startup_agent_max_iterations()
             logger.info(
                 "Agent budget: max_iterations=%d (agent.max_turns from config.yaml, "
                 "or HERMES_MAX_ITERATIONS from .env, or default 500)",
