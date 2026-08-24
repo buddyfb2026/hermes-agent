@@ -37,6 +37,26 @@ def test_reload_runtime_env_preserves_config_max_turns(tmp_path: Path, monkeypat
     assert os.environ["HERMES_MAX_ITERATIONS"] == "9000"
 
 
+def test_startup_budget_uses_same_config_authoritative_resolver(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"agent": {"max_turns": 25}}),
+        encoding="utf-8",
+    )
+    (hermes_home / ".env").write_text(
+        "HERMES_MAX_ITERATIONS=500\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setenv("HERMES_MAX_ITERATIONS", "500")
+
+    assert gateway_run._startup_agent_max_iterations() == 25
+    assert gateway_run._current_max_iterations() == 25
+
+
 def test_reload_runtime_env_preserves_config_terminal_backend(
     tmp_path: Path, monkeypatch
 ) -> None:

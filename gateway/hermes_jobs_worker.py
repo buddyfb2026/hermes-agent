@@ -42,6 +42,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -197,6 +198,15 @@ ZERO_API_CALLS_ERROR = (
     "zero successful api calls before producing output — releasing row for retry"
 )
 
+PACKET_EVIDENCE_MISSING_MARKER = "packet completion evidence missing"
+PACKET_EVIDENCE_MISSING_ERROR = (
+    "packet completion evidence missing: no post-queue canonical packet handoff "
+    "was observed for the expected version — "
+    "releasing row for retry"
+)
+PACKET_EVIDENCE_POLL_SECONDS = 30.0
+PACKET_EVIDENCE_POLL_INTERVAL_SECONDS = 2.0
+
 # Bounded exponential backoff applied AFTER a zero-api-calls release, so a
 # sustained 429 / auth-dead window doesn't spin every idle Avenger re-claiming
 # and re-tripping the same wall every poll tick. Reset to 0 on the next
@@ -227,6 +237,7 @@ TRANSIENT_FAILURE_SUBSTRINGS = (
     # confidently-observed zero-successful-call run as transient: RELEASE so
     # the next idle Avenger retries once the rate-limit / auth window clears.
     ZERO_API_CALLS_MARKER,
+    PACKET_EVIDENCE_MISSING_MARKER,
 )
 
 
@@ -454,6 +465,9 @@ class HermesJobsWorker:
         poll_jitter_seconds: float = 2.0,
         lease_renewal_interval_seconds: float = 300.0,
         runner=None,
+        packet_event_fetcher=None,
+        packet_evidence_poll_seconds: float = PACKET_EVIDENCE_POLL_SECONDS,
+        packet_evidence_poll_interval_seconds: float = PACKET_EVIDENCE_POLL_INTERVAL_SECONDS,
     ):
         self.callsign = callsign
         self.profile_name = profile_name or profile_for_callsign(callsign) or "default"
@@ -468,6 +482,11 @@ class HermesJobsWorker:
         # cron.scheduler.run_job (lazy-imported inside _process_row to
         # avoid pulling cron at module import time).
         self._runner = runner
+        self._packet_event_fetcher = packet_event_fetcher
+        self.packet_evidence_poll_seconds = max(0.0, packet_evidence_poll_seconds)
+        self.packet_evidence_poll_interval_seconds = max(
+            0.01, packet_evidence_poll_interval_seconds,
+        )
         self._stop_event = asyncio.Event()
         self._pool = None  # asyncpg.Pool
         self._current_row_id = None  # set while processing
@@ -769,6 +788,10 @@ class HermesJobsWorker:
         error_msg: Optional[str] = None
         try:
             success, error_msg = await self._run_packet_authoring(row)
+            if success and row.get("dispatch_lane") == "packet_authoring":
+                if not await self._wait_for_packet_completion_evidence(row):
+                    success = False
+                    error_msg = PACKET_EVIDENCE_MISSING_ERROR
         except Exception as e:
             success = False
             error_msg = f"{type(e).__name__}: {e}"
@@ -819,6 +842,149 @@ class HermesJobsWorker:
                 )
         else:
             self._rate_limit_backoff_seconds = 0.0
+
+    @staticmethod
+    def _parse_timestamp(value) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str) and value.strip():
+            try:
+                parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _has_packet_completion_evidence(cls, row: Mapping, events) -> bool:
+        """Require the canonical v1 or rework handoff for this queue run."""
+        queued_at = cls._parse_timestamp(row.get("queued_at"))
+        if queued_at is None:
+            return False
+        payload = row.get("payload") or {}
+        metadata = row.get("metadata") or {}
+        for name, value in (("payload", payload), ("metadata", metadata)):
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except (TypeError, ValueError):
+                    parsed = {}
+                if name == "payload":
+                    payload = parsed
+                else:
+                    metadata = parsed
+        try:
+            version = int(
+                (payload if isinstance(payload, dict) else {}).get("packet_version")
+                or (metadata if isinstance(metadata, dict) else {}).get(
+                    "packet_version_target"
+                )
+                or (metadata if isinstance(metadata, dict) else {}).get("packet_version")
+                or 1
+            )
+        except (TypeError, ValueError):
+            return False
+        issue_id = str(row.get("issue_id") or "")
+        issue_key = str(row.get("issue_key") or "")
+        observed = set()
+        for event in events or ():
+            if not isinstance(event, Mapping):
+                continue
+            event_issue_id = str(event.get("issue_id") or "")
+            event_issue_key = str(event.get("issue_key") or "")
+            if issue_id and event_issue_id and event_issue_id != issue_id:
+                continue
+            if issue_key and event_issue_key and event_issue_key != issue_key:
+                continue
+            raw_event_version = event.get("packet_version")
+            if raw_event_version is None:
+                continue
+            try:
+                event_version = int(raw_event_version)
+            except (TypeError, ValueError):
+                continue
+            if event_version != version:
+                continue
+            created_at = cls._parse_timestamp(event.get("created_at"))
+            if created_at is None or created_at < queued_at:
+                continue
+            event_type = str(event.get("type") or event.get("event_type") or "")
+            if event_type in {"packet_created", "packet_resubmitted", "review_requested"}:
+                observed.add(event_type)
+        if version == 1:
+            return {"packet_created", "review_requested"}.issubset(observed)
+        if version >= 2:
+            # BIZ-176's CCD review emitter consumes packet_resubmitted itself;
+            # canonical rework rows do not emit a second review_requested.
+            #
+            # BIZ-1308 review: this MUST NOT enumerate specific versions. An
+            # earlier form matched only {2, 3}, so any higher version fell
+            # through to the unconditional `return False` below and could never
+            # be corroborated — and because missing evidence RELEASES the row
+            # rather than failing it, such a job re-authored and released
+            # forever. That is reachable, not theoretical: BIZ-421 ran at
+            # packet_version 4 (hermes_jobs, queued 2026-06-12). The rework
+            # contract is "not v1", so bound it that way and it stays correct
+            # as the version ceiling moves.
+            return "packet_resubmitted" in observed
+        return False
+
+    async def _fetch_packet_events(self, row: Mapping):
+        if self._packet_event_fetcher is not None:
+            result = self._packet_event_fetcher(row)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result
+        issue_id = str(row.get("issue_id") or "").strip()
+        if not issue_id or self._pool is None:
+            return []
+        try:
+            async with self._pool.acquire() as conn:
+                records = await conn.fetch(
+                    """SELECT issue_id,
+                              issue_key,
+                              event_type AS type,
+                              packet_version,
+                              occurred_at AS created_at
+                         FROM linear_packet_events
+                        WHERE issue_id = $1
+                          AND event_type IN (
+                            'packet_created',
+                            'packet_resubmitted',
+                            'review_requested'
+                          )
+                        ORDER BY occurred_at ASC""",
+                    issue_id,
+                )
+            return [dict(record) for record in records]
+        except Exception as exc:
+            logger.warning(
+                "HermesJobsWorker (%s) could not query durable packet evidence for %s: %s",
+                self.callsign, row.get("issue_key", "?"), exc,
+            )
+            return []
+
+    async def _wait_for_packet_completion_evidence(self, row: Mapping) -> bool:
+        """Boundedly poll durable packet events to absorb propagation lag."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.packet_evidence_poll_seconds
+        while True:
+            if self._has_packet_completion_evidence(row, await self._fetch_packet_events(row)):
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=min(self.packet_evidence_poll_interval_seconds, remaining),
+                )
+                return False
+            except asyncio.TimeoutError:
+                pass
 
     @staticmethod
     def _resolve_session_agent(adapter, session_key: str):

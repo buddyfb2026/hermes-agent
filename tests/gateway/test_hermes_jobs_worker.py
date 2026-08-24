@@ -36,6 +36,7 @@ from gateway.hermes_jobs_worker import (
     CLAIM_NEXT_HERMES_JOB_SQL,
     COMPLETE_JOB_SQL,
     FAIL_JOB_SQL,
+    PACKET_EVIDENCE_MISSING_MARKER,
     PROFILE_TO_CALLSIGN,
     RATE_LIMIT_BACKOFF_BASE_SECONDS,
     RATE_LIMIT_BACKOFF_CAP_SECONDS,
@@ -294,6 +295,10 @@ class _FakeConnection:
         self._pool.calls.append(("fetchrow", sql, args))
         return self._pool.next_claim_row()
 
+    async def fetch(self, sql: str, *args):
+        self._pool.calls.append(("fetch", sql, args))
+        return list(self._pool.packet_event_rows)
+
     async def fetchval(self, sql: str, *args):
         self._pool.calls.append(("fetchval", sql, args))
         return self._pool.next_renewal_value()
@@ -322,9 +327,11 @@ class _FakePool:
         *,
         claim_rows: Optional[list] = None,
         renewal_returns: Optional[list] = None,
+        packet_event_rows: Optional[list] = None,
     ):
         self._claim_rows = list(claim_rows or [])
         self._renewal_returns = list(renewal_returns or [])
+        self.packet_event_rows = list(packet_event_rows or [])
         self.calls: list = []
         self.closed = False
 
@@ -345,12 +352,26 @@ class _FakePool:
         self.closed = True
 
 
+def _valid_packet_events(_row):
+    return [
+        {
+            "type": "packet_resubmitted",
+            "packet_version": 2,
+            "issue_id": "iid",
+            "issue_key": "BIZ-208",
+            "created_at": "2026-08-24T12:00:01Z",
+        },
+    ]
+
+
 def _make_worker(
     *,
     callsign: str = "Black Widow",
     pool: Optional[_FakePool] = None,
     runner=None,
     issue_room_root=None,
+    packet_event_fetcher=_valid_packet_events,
+    packet_evidence_poll_seconds: float = 0.0,
     poll_interval_seconds: float = 0.01,
     poll_jitter_seconds: float = 0.0,
     lease_renewal_interval_seconds: float = 0.05,
@@ -365,13 +386,21 @@ def _make_worker(
         poll_jitter_seconds=poll_jitter_seconds,
         lease_renewal_interval_seconds=lease_renewal_interval_seconds,
         runner=runner,
+        packet_event_fetcher=packet_event_fetcher,
+        packet_evidence_poll_seconds=packet_evidence_poll_seconds,
+        packet_evidence_poll_interval_seconds=0.01,
     )
     if pool is not None:
         worker._pool = pool
     return worker
 
 
-def _row(claim_id="rid-1", issue_key="BIZ-208", packet_version=2):
+def _row(
+    claim_id="rid-1",
+    issue_key="BIZ-208",
+    packet_version: Any = 2,
+    metadata=None,
+):
     return {
         "id": claim_id,
         "issue_id": "iid",
@@ -379,8 +408,9 @@ def _row(claim_id="rid-1", issue_key="BIZ-208", packet_version=2):
         "title": "t",
         "priority": 0,
         "dispatch_lane": "packet_authoring",
+        "queued_at": "2026-08-24T12:00:00Z",
         "payload": {"packet_message": "do the thing", "packet_version": packet_version},
-        "metadata": {},
+        "metadata": metadata or {},
     }
 
 
@@ -561,6 +591,166 @@ class TestWorkerProcessRow:
         fail_calls = [c for c in execute_calls if "failed_at = now()" in c[1]]
         assert fail_calls
         assert "empty packet_message" in fail_calls[0][2][2]
+
+
+@pytest.mark.asyncio
+class TestPacketAuthoringCompletionContract:
+    async def test_clean_run_with_api_calls_but_no_events_releases_not_completes(self):
+        pool = _FakePool()
+
+        def runner(_job):
+            return (True, "doc", "I ran cleanly after several API calls", None)
+
+        worker = _make_worker(
+            pool=pool,
+            runner=runner,
+            packet_event_fetcher=lambda _row: [],
+        )
+        await worker._process_row(_row(issue_key="BIZ-1289"))
+
+        execute_calls = [call for call in pool.calls if call[0] == "execute"]
+        assert any("claimed_by = NULL" in call[1] for call in execute_calls)
+        assert not any("completed_at = now()" in call[1] for call in execute_calls)
+        assert PACKET_EVIDENCE_MISSING_MARKER in execute_calls[-1][2][2]
+
+    async def test_rework_target_from_metadata_with_only_resubmitted_completes(self):
+        pool = _FakePool()
+        worker = _make_worker(
+            pool=pool,
+            runner=lambda _job: (True, "doc", "complete", None),
+        )
+        await worker._process_row(
+            _row(packet_version="", metadata={"packet_version_target": 2})
+        )
+        execute_calls = [call for call in pool.calls if call[0] == "execute"]
+        assert any("completed_at = now()" in call[1] for call in execute_calls)
+        assert not any("claimed_by = NULL" in call[1] for call in execute_calls)
+
+    async def test_rework_wrong_version_resubmission_releases_for_retry(self):
+        pool = _FakePool()
+        stale_event = dict(_valid_packet_events(None)[0], packet_version=1)
+        worker = _make_worker(
+            pool=pool,
+            runner=lambda _job: (True, "doc", "complete", None),
+            packet_event_fetcher=lambda _row: [stale_event],
+        )
+        await worker._process_row(
+            _row(packet_version="", metadata={"packet_version_target": 2})
+        )
+        execute_calls = [call for call in pool.calls if call[0] == "execute"]
+        assert any("claimed_by = NULL" in call[1] for call in execute_calls)
+        assert not any("completed_at = now()" in call[1] for call in execute_calls)
+
+    async def test_v1_still_requires_created_and_review_requested_pair(self):
+        row = _row(packet_version="", metadata={})
+        created = {
+            "type": "packet_created",
+            "packet_version": 1,
+            "issue_id": "iid",
+            "issue_key": "BIZ-208",
+            "created_at": "2026-08-24T12:00:01Z",
+        }
+        review = dict(
+            created,
+            type="review_requested",
+            created_at="2026-08-24T12:00:02Z",
+        )
+
+        assert not HermesJobsWorker._has_packet_completion_evidence(row, [created])
+        assert HermesJobsWorker._has_packet_completion_evidence(row, [created, review])
+
+    async def test_rework_versions_above_three_are_corroborated(self):
+        """BIZ-1308 regression: the rework rule is 'not v1', never an enum.
+
+        A predicate matching only {2, 3} returns False for any higher version
+        no matter what evidence exists. Because missing evidence RELEASES the
+        row instead of failing it, such a job re-authors and releases forever.
+        BIZ-421 really ran at packet_version 4 (hermes_jobs, queued
+        2026-06-12), so this is a reachable strand, not a hypothetical.
+        """
+        for version in (4, 5, 12):
+            row = _row(packet_version=version)
+            resubmitted = {
+                "type": "packet_resubmitted",
+                "packet_version": version,
+                "issue_id": "iid",
+                "issue_key": "BIZ-208",
+                "created_at": "2026-08-24T12:00:01Z",
+            }
+
+            assert HermesJobsWorker._has_packet_completion_evidence(
+                row, [resubmitted]
+            ), f"v{version} rework evidence must corroborate"
+
+            # Still discriminating: evidence for a DIFFERENT version must not
+            # satisfy this run, or the fix would be a blanket accept.
+            wrong_version = dict(resubmitted, packet_version=version - 1)
+            assert not HermesJobsWorker._has_packet_completion_evidence(
+                row, [wrong_version]
+            ), f"v{version} must reject v{version - 1} evidence"
+
+            # And a v1-shaped pair must not satisfy a rework run either.
+            created = dict(resubmitted, type="packet_created")
+            review = dict(resubmitted, type="review_requested")
+            assert not HermesJobsWorker._has_packet_completion_evidence(
+                row, [created, review]
+            ), f"v{version} must require packet_resubmitted specifically"
+
+    async def test_default_fetch_reads_canonical_events_from_central_db(self):
+        pool = _FakePool(packet_event_rows=_valid_packet_events(None))
+        worker = _make_worker(
+            pool=pool,
+            packet_event_fetcher=None,
+        )
+
+        events = await worker._fetch_packet_events(_row())
+
+        assert events == _valid_packet_events(None)
+        fetch_calls = [call for call in pool.calls if call[0] == "fetch"]
+        assert len(fetch_calls) == 1
+        assert "FROM linear_packet_events" in fetch_calls[0][1]
+        assert fetch_calls[0][2] == ("iid",)
+
+    async def test_max_iteration_incomplete_equivalent_fails_closed(self):
+        pool = _FakePool()
+        final = "max_iterations_reached(25/25): incomplete; no packet or events"
+        worker = _make_worker(
+            pool=pool,
+            runner=lambda _job: (True, "", final, None),
+            packet_event_fetcher=lambda _row: [],
+        )
+        await worker._process_row(_row(issue_key="BIZ-1289"))
+        execute_calls = [call for call in pool.calls if call[0] == "execute"]
+        assert any("claimed_by = NULL" in call[1] for call in execute_calls)
+        assert not any("completed_at = now()" in call[1] for call in execute_calls)
+
+    async def test_bounded_poll_observes_delayed_event_pair(self):
+        attempts = 0
+
+        def delayed(_row):
+            nonlocal attempts
+            attempts += 1
+            return [] if attempts == 1 else _valid_packet_events(_row)
+
+        worker = _make_worker(
+            packet_event_fetcher=delayed,
+            packet_evidence_poll_seconds=0.1,
+        )
+        assert await worker._wait_for_packet_completion_evidence(_row()) is True
+        assert attempts == 2
+
+    async def test_non_packet_lane_does_not_require_packet_events(self):
+        pool = _FakePool()
+        row = _row()
+        row["dispatch_lane"] = "pr_review"
+        worker = _make_worker(
+            pool=pool,
+            runner=lambda _job: (True, "", "reviewed", None),
+            packet_event_fetcher=lambda _row: [],
+        )
+        await worker._process_row(row)
+        execute_calls = [call for call in pool.calls if call[0] == "execute"]
+        assert any("completed_at = now()" in call[1] for call in execute_calls)
 
 
 @pytest.mark.asyncio
