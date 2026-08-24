@@ -37,6 +37,20 @@ jobs:
           uv pip install --system -e . 2>&1 | Select-Object -Last 5
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: LEG 0 - cold-start canary (import + serve --help timing)
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:HERMES_HOME = "$env:RUNNER_TEMP\hh-canary"
+          New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          python -c "import hermes_cli.main" 2>&1 | Select-Object -Last 3
+          Write-Host "import hermes_cli.main: $($sw.Elapsed.TotalSeconds)s"
+          $sw.Restart()
+          python -m hermes_cli.main serve --help 2>&1 | Select-Object -Last 3
+          Write-Host "serve --help: $($sw.Elapsed.TotalSeconds)s (exit=$LASTEXITCODE)"
+
       - name: LEG 1 HEAD - serve sentinel fires on held port (reporter repro)
         timeout-minutes: 8
         shell: pwsh
@@ -51,7 +65,7 @@ jobs:
           Start-Sleep -Seconds 3
           # stdin from NUL (EOF for any unexpected prompt), output to files, bounded wait
           $p = Start-Process cmd -ArgumentList '/c', 'python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 < NUL > "%RUNNER_TEMP%\serve-conflict.log" 2>&1' -PassThru
-          $deadline = (Get-Date).AddSeconds(120)
+          $deadline = (Get-Date).AddSeconds(240)
           while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
           $timedOut = -not $p.HasExited
           if ($timedOut) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
@@ -75,7 +89,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
           Set-Content -Path "$env:HERMES_HOME\config.yaml" -Value "model:`n  provider: openrouter`n  model: test`n"
           $p = Start-Process cmd -ArgumentList '/c', 'python -m hermes_cli.main serve --host 127.0.0.1 --port 0 < NUL > "%RUNNER_TEMP%\serve-free.log" 2>&1' -PassThru
-          $deadline = (Get-Date).AddSeconds(90)
+          $deadline = (Get-Date).AddSeconds(180)
           $ready = $false
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 2
@@ -115,7 +129,7 @@ jobs:
           $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(300)" -PassThru
           Start-Sleep -Seconds 3
           $p = Start-Process cmd -ArgumentList '/c', 'python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 < NUL > "%RUNNER_TEMP%\serve-base.log" 2>&1' -PassThru
-          $deadline = (Get-Date).AddSeconds(120)
+          $deadline = (Get-Date).AddSeconds(240)
           while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
           $timedOut = -not $p.HasExited
           if ($timedOut) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
@@ -135,7 +149,8 @@ jobs:
         with:
           name: 93608-ab-proof-logs
           path: |
+            ${{ runner.temp }}/serve-conflict.log
+            ${{ runner.temp }}/serve-base.log
             ${{ runner.temp }}/serve-free.log
-            ${{ runner.temp }}/serve-free.err
             ${{ runner.temp }}/claim-probe-*.log
           if-no-files-found: ignore
