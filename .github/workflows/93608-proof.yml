@@ -1,0 +1,121 @@
+name: 93608 A/B proof (TEMPORARY - delete before merge)
+
+# TEMPORARY workflow for the #93608 live-repro gate. Push-to-branch trigger
+# only (harness skill rule: never pull_request for Windows runners). This file
+# exists ONLY on the throwaway e2e/93608-proof branch and is deleted before
+# any merge ask.
+
+on:
+  push:
+    branches:
+      - e2e/93608-proof
+
+permissions:
+  contents: read
+
+jobs:
+  ab-proof:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: Install python deps (head)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip uv
+          uv pip install --system -e . 2>&1 | Select-Object -Last 5
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: LEG 1 HEAD - serve sentinel fires on held port (reporter repro)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:HERMES_HOME = "$env:RUNNER_TEMP\hh-head"
+          New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
+          # hold 9119 exactly like the reporter did
+          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(120)" -PassThru
+          Start-Sleep -Seconds 3
+          $out = python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue
+          Write-Host "exit=$code"
+          Write-Host $out
+          if ($code -ne 75) { Write-Host "FAIL: expected exit 75, got $code"; exit 1 }
+          if ($out -notmatch 'BACKEND_PORT_IN_USE port=9119') { Write-Host "FAIL: sentinel missing"; exit 1 }
+          if ($out -match 'HERMES_BACKEND_READY') { Write-Host "FAIL: ready line on conflict"; exit 1 }
+          Write-Host "PASS: head emits sentinel + exit 75"
+
+      - name: LEG 2 HEAD - free port boots and announces ready
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:HERMES_HOME = "$env:RUNNER_TEMP\hh-head2"
+          New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
+          $p = Start-Process python -ArgumentList '-m','hermes_cli.main','serve','--host','127.0.0.1','--port','0' -RedirectStandardOutput "$env:RUNNER_TEMP\serve-free.log" -RedirectStandardError "$env:RUNNER_TEMP\serve-free.err" -PassThru
+          $deadline = (Get-Date).AddSeconds(90)
+          $ready = $false
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+            if ((Get-Content "$env:RUNNER_TEMP\serve-free.log" -Raw -ErrorAction SilentlyContinue) -match 'HERMES_BACKEND_READY') { $ready = $true; break }
+            if ($p.HasExited) { break }
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          if (-not $ready) {
+            Write-Host "FAIL: no ready line on free port"
+            Get-Content "$env:RUNNER_TEMP\serve-free.log" -ErrorAction SilentlyContinue | Select-Object -Last 20
+            Get-Content "$env:RUNNER_TEMP\serve-free.err" -ErrorAction SilentlyContinue | Select-Object -Last 20
+            exit 1
+          }
+          Write-Host "PASS: free port boots + HERMES_BACKEND_READY"
+
+      - name: LEG 3 HEAD - claim degrades on probe failure with live child (real PowerShell)
+        shell: pwsh
+        working-directory: apps/desktop
+        run: |
+          npm ci --no-audit --no-fund 2>&1 | Select-Object -Last 2
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          node ..\..\tests\install\e2e-93608-claim-probe.cjs
+          if ($LASTEXITCODE -ne 0) { Write-Host "FAIL: head claim-probe A/B"; exit 1 }
+          Write-Host "PASS: head degrade + fail-closed + real-probe legs"
+
+      - name: LEG 4 BASE - bug fires on merge-base (serve half)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          # merge-base with main predates both fixes
+          $base = git merge-base origin/main HEAD
+          git checkout $base -- hermes_cli/web_server.py
+          $env:HERMES_HOME = "$env:RUNNER_TEMP\hh-base"
+          New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
+          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(120)" -PassThru
+          Start-Sleep -Seconds 3
+          $out = python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue
+          git checkout HEAD -- hermes_cli/web_server.py
+          Write-Host "base exit=$code"
+          if ($code -eq 75 -or $out -match 'BACKEND_PORT_IN_USE') { Write-Host "FAIL: base already has the fix?"; exit 1 }
+          if ($code -ne 1) { Write-Host "WARN: base exit was $code (expected 1)"; }
+          Write-Host "PASS: base shows bare bind failure (exit=$code, no sentinel) - bug fires"
+
+      - name: Upload proof logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: 93608-ab-proof-logs
+          path: |
+            ${{ runner.temp }}/serve-free.log
+            ${{ runner.temp }}/serve-free.err
+            ${{ runner.temp }}/claim-probe-*.log
+          if-no-files-found: ignore
