@@ -61,7 +61,7 @@ jobs:
           # minimal config so serve cannot enter first-run interactive prompts
           Set-Content -Path "$env:HERMES_HOME\config.yaml" -Value "model:`n  provider: openrouter`n  model: test`n"
           # hold 9119 exactly like the reporter did
-          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(300)" -PassThru
+          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(300)" -PassThru
           Start-Sleep -Seconds 3
           # stdin from NUL (EOF for any unexpected prompt), output to files, bounded wait
           $p = Start-Process cmd -ArgumentList '/c', 'python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 < NUL > "%RUNNER_TEMP%\serve-conflict.log" 2>&1' -PassThru
@@ -126,7 +126,7 @@ jobs:
           $env:HERMES_HOME = "$env:RUNNER_TEMP\hh-base"
           New-Item -ItemType Directory -Force -Path $env:HERMES_HOME | Out-Null
           Set-Content -Path "$env:HERMES_HOME\config.yaml" -Value "model:`n  provider: openrouter`n  model: test`n"
-          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(300)" -PassThru
+          $holder = Start-Process python -ArgumentList '-c', "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1); s.bind(('127.0.0.1',9119)); s.listen(1); time.sleep(300)" -PassThru
           Start-Sleep -Seconds 3
           $p = Start-Process cmd -ArgumentList '/c', 'python -m hermes_cli.main serve --host 127.0.0.1 --port 9119 < NUL > "%RUNNER_TEMP%\serve-base.log" 2>&1' -PassThru
           $deadline = (Get-Date).AddSeconds(240)
