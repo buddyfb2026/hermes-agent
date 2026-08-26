@@ -157,7 +157,7 @@ def verify(args: argparse.Namespace) -> int:
         raise UpdateError("candidate must be committed and clean before verification")
     checks = [
         ["uvx", "uv@0.9.28", "lock", "--check"],
-        ["uv", "sync", "--locked", "--extra", "dev", "--extra", "messaging"],
+        ["uv", "sync", "--locked", "--extra", "dev", "--extra", "all"],
         ["uv", "run", "--no-sync", "pytest", "-q"],
         ["node", "--check", "apps/desktop/src/plugins/hermes-bots/plugin.js"],
         ["npm", "ci"],
