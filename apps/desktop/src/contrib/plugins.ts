@@ -14,10 +14,17 @@
  */
 
 import { createPluginContext, type HermesPlugin } from './plugin'
+import { selectBundledPluginEntrypoints } from './plugin-entrypoints'
 import { pluginActive, publishPlugin } from './plugins-store'
 import { watchRuntimePlugins } from './runtime-loader'
 
-const modules = import.meta.glob<{ default: HermesPlugin }>('../plugins/*/plugin.{js,ts,tsx}', { eager: true })
+const discoveredModules = import.meta.glob<{ default: HermesPlugin }>('../plugins/*/plugin.{js,ts,tsx}', { eager: true })
+const selection = selectBundledPluginEntrypoints(discoveredModules)
+const modules = selection.modules
+
+for (const collision of selection.collisions) {
+  console.warn(`[plugins] duplicate bundled entrypoint ${collision.ignored} ignored; using ${collision.kept}`)
+}
 
 // One-shot init guard. Contributions themselves register by id (re-registering
 // is idempotent), but the disk-door watcher setup below (watchRuntimePlugins)
