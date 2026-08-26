@@ -3,8 +3,8 @@
 
 The official Desktop updater targets origin/main. Bizina carries a reviewed patch
 stack on fork/biab-208-v020-20260819, so updates are integrations, not pulls.
-This command keeps candidate creation, verification, and promotion as separate
-commit points with an atomic JSON receipt.
+This command keeps candidate creation, verification, staged promotion, runtime
+completion, and rollback as separate commit points with an atomic JSON receipt.
 """
 from __future__ import annotations
 
@@ -202,10 +202,68 @@ def promote(args: argparse.Namespace) -> int:
     tag = "bizina-hermes-pre-update-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     git(live, "tag", tag, previous)
     git(live, "merge", "--ff-only", receipt["candidate_head"])
-    git(live, "push", args.fork_remote, f"HEAD:refs/heads/{receipt['stable_branch']}")
-    receipt.update(status="promoted", promoted_at=iso_now(), previous_head=previous, rollback_tag=tag, promoted_head=head(live))
+    receipt.update(
+        status="promotion_pending_validation",
+        promotion_started_at=iso_now(),
+        previous_head=previous,
+        rollback_tag=tag,
+        promoted_head=head(live),
+    )
     atomic_json(candidate_receipt(candidate), receipt)
-    print(json.dumps({"status": "promoted", "previous": previous, "head": head(live), "rollback_tag": tag}, indent=2))
+    print(json.dumps({"status": "promotion_pending_validation", "previous": previous, "head": head(live), "rollback_tag": tag}, indent=2))
+    return 0
+
+
+def complete(args: argparse.Namespace) -> int:
+    """Publish a staged promotion only after the wrapper proves runtime health."""
+    if not args.yes:
+        raise UpdateError("completion requires --yes")
+    candidate = args.candidate.resolve()
+    receipt = load_receipt(candidate)
+    if receipt.get("status") != "promotion_pending_validation":
+        raise UpdateError("candidate is not pending runtime validation")
+    live = Path(receipt["live_root"])
+    if dirty_paths(live):
+        raise UpdateError("live checkout became dirty during validation")
+    if branch(live) != receipt["stable_branch"]:
+        raise UpdateError("live checkout left the stable branch during validation")
+    if head(live) != receipt.get("promoted_head") or head(live) != receipt.get("candidate_head"):
+        raise UpdateError("live head no longer matches the validated candidate")
+    git(live, "push", args.fork_remote, f"HEAD:refs/heads/{receipt['stable_branch']}")
+    receipt.update(status="promoted", promoted_at=iso_now(), runtime_validation="passed")
+    atomic_json(candidate_receipt(candidate), receipt)
+    print(json.dumps({"status": "promoted", "previous": receipt["previous_head"], "head": head(live), "rollback_tag": receipt["rollback_tag"]}, indent=2))
+    return 0
+
+
+def rollback(args: argparse.Namespace) -> int:
+    """Restore the exact pre-promotion source head after failed runtime validation."""
+    if not args.yes:
+        raise UpdateError("rollback requires --yes")
+    candidate = args.candidate.resolve()
+    receipt = load_receipt(candidate)
+    if receipt.get("status") not in {"promotion_pending_validation", "rollback_failed"}:
+        raise UpdateError("candidate is not in a rollback-eligible state")
+    live = Path(receipt["live_root"])
+    previous = str(receipt.get("previous_head") or "")
+    promoted = str(receipt.get("promoted_head") or "")
+    if not previous or not promoted:
+        raise UpdateError("receipt lacks the pre-promotion rollback boundary")
+    if dirty_paths(live):
+        raise UpdateError("live checkout is dirty; refusing destructive rollback")
+    if branch(live) != receipt["stable_branch"]:
+        raise UpdateError("live checkout left the stable branch; refusing rollback")
+    if head(live) != promoted:
+        raise UpdateError("live head changed after promotion; refusing rollback")
+    try:
+        git(live, "reset", "--hard", previous)
+    except UpdateError as exc:
+        receipt.update(status="rollback_failed", rollback_failed_at=iso_now(), rollback_error=str(exc))
+        atomic_json(candidate_receipt(candidate), receipt)
+        raise
+    receipt.update(status="rolled_back", rolled_back_at=iso_now(), rollback_reason=args.reason, restored_head=head(live))
+    atomic_json(candidate_receipt(candidate), receipt)
+    print(json.dumps({"status": "rolled_back", "failed_head": promoted, "restored_head": head(live), "reason": args.reason}, indent=2))
     return 0
 
 
@@ -245,6 +303,13 @@ def parser() -> argparse.ArgumentParser:
     pro = sub.add_parser("promote")
     pro.add_argument("candidate", type=Path)
     pro.add_argument("--yes", action="store_true")
+    done = sub.add_parser("complete")
+    done.add_argument("candidate", type=Path)
+    done.add_argument("--yes", action="store_true")
+    undo = sub.add_parser("rollback")
+    undo.add_argument("candidate", type=Path)
+    undo.add_argument("--reason", required=True)
+    undo.add_argument("--yes", action="store_true")
     sub.add_parser("status")
     return p
 
@@ -252,7 +317,15 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        return {"prepare": prepare, "finalize": finalize, "verify": verify, "promote": promote, "status": status}[args.action](args)
+        return {
+            "prepare": prepare,
+            "finalize": finalize,
+            "verify": verify,
+            "promote": promote,
+            "complete": complete,
+            "rollback": rollback,
+            "status": status,
+        }[args.action](args)
     except UpdateError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

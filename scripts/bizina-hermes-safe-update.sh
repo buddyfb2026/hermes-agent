@@ -24,6 +24,10 @@
 #   2. CANARY_FILE exists (gateway/hermes_jobs_worker.py — the consumer)
 #   3. All Avenger gateway LaunchAgents are running with fresh PIDs
 #   4. Each Avenger gateway has a postgres connection (queue consumer is wired)
+#   5. The configured Desktop connection is reachable before restart
+#   6. The packaged app has a valid strict code signature
+#   7. Desktop reaches ready state without boot, ticket, or renderer failures
+#   8. The new Desktop process remains stable before the candidate is published
 #
 # Exit codes:
 #   0  success — all invariants hold
@@ -34,14 +38,19 @@
 set -uo pipefail
 
 # ─── Config ──────────────────────────────────────────────────────────────────
-HERMES_AGENT_DIR="${HOME}/.hermes/hermes-agent"
-FORK_BRANCH="biab-208-v020-20260819"
-CANARY_FILE="gateway/hermes_jobs_worker.py"
+HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-${HOME}/.hermes/hermes-agent}"
+FORK_BRANCH="${FORK_BRANCH:-biab-208-v020-20260819}"
+CANARY_FILE="${CANARY_FILE:-gateway/hermes_jobs_worker.py}"
 AVENGER_PROFILES=(hermes2 hermes3 hermes4 hermes5)
 PRIMARY_LABEL="ai.hermes.gateway"
 UID_NUM="$(id -u)"
-HERMES_BIN="${HOME}/.local/bin/hermes"
-MANAGED_SCRIPT="${HOME}/.hermes/scripts/bizina-managed_update.py"
+HERMES_BIN="${HERMES_BIN:-${HOME}/.local/bin/hermes}"
+MANAGED_SCRIPT="${MANAGED_SCRIPT:-${HOME}/.hermes/scripts/bizina-managed_update.py}"
+DESKTOP_DATA_DIR="${DESKTOP_DATA_DIR:-${HOME}/Library/Application Support/Hermes}"
+DESKTOP_LOG="${DESKTOP_LOG:-${HOME}/.hermes/logs/desktop.log}"
+DESKTOP_ROLLOUT_TIMEOUT="${DESKTOP_ROLLOUT_TIMEOUT:-45}"
+DESKTOP_STABILITY_SECONDS="${DESKTOP_STABILITY_SECONDS:-12}"
+CODESIGN_BIN="${CODESIGN_BIN:-/usr/bin/codesign}"
 
 # ─── Output helpers ──────────────────────────────────────────────────────────
 log()  { printf "%s [%s] %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2"; }
@@ -237,6 +246,153 @@ raise SystemExit("Desktop did not relaunch")
 PY
 }
 
+selected_connection_preflight() {
+  # Catch the exact 2026-08-26 outage before taking Desktop down: the saved
+  # primary pointed at 100.113.48.24:9119 while no service listened there.
+  python3 - "$DESKTOP_DATA_DIR/connections.json" <<'PY'
+import json, pathlib, sys, urllib.error, urllib.parse, urllib.request
+
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    print("Desktop connection preflight: no connections.json; local startup expected")
+    raise SystemExit(0)
+data = json.loads(path.read_text())
+primary = data.get("primary", "local")
+if primary == "local":
+    print("Desktop connection preflight: primary=local")
+    raise SystemExit(0)
+record = next((row for row in data.get("connections", []) if row.get("id") == primary), None)
+if not record or record.get("kind") != "remote" or not record.get("url"):
+    raise SystemExit(f"Desktop connection preflight failed: invalid primary connection {primary!r}")
+base = str(record["url"]).rstrip("/")
+url = base + "/api/status"
+try:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        if response.status != 200:
+            raise RuntimeError(f"HTTP {response.status}")
+        json.loads(response.read())
+except Exception as exc:
+    raise SystemExit(f"Desktop connection preflight failed for {base}: {exc}")
+print(f"Desktop connection preflight: {base} /api/status=200")
+PY
+}
+
+desktop_log_line_count() {
+  [[ -f "$DESKTOP_LOG" ]] && wc -l < "$DESKTOP_LOG" | tr -d ' ' || printf '0\n'
+}
+
+verify_desktop_rollout() {
+  local start_line="${1:-0}"
+  local exe="${HERMES_AGENT_DIR}/apps/desktop/release/mac-arm64/Hermes.app/Contents/MacOS/Hermes"
+  python3 - "$exe" "$DESKTOP_LOG" "$start_line" "$DESKTOP_ROLLOUT_TIMEOUT" "$DESKTOP_STABILITY_SECONDS" "${DESKTOP_TEST_PID:-}" <<'PY'
+import os, pathlib, subprocess, sys, time
+
+exe, log_name = sys.argv[1], sys.argv[2]
+start_line, timeout, settle = int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])
+test_pid = int(sys.argv[6]) if sys.argv[6] else None
+failure_markers = (
+    "Desktop boot failed:",
+    "[error-boundary:",
+    "ReferenceError:",
+    "Unhandled rejection:",
+    "Uncaught Exception:",
+)
+ready_markers = (
+    "Hermes backend is ready. Finalizing desktop startup",
+    "Remote Hermes backend is ready",
+)
+
+def live_pids():
+    if test_pid is not None:
+        try:
+            os.kill(test_pid, 0)
+            return [test_pid]
+        except ProcessLookupError:
+            return []
+    output = subprocess.check_output(["ps", "-axo", "pid=,command="], text=True)
+    found = []
+    for line in output.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and (parts[1] == exe or parts[1].startswith(exe + " ")):
+            found.append(int(parts[0]))
+    return found
+
+deadline = time.monotonic() + timeout
+ready_at = None
+while time.monotonic() < deadline:
+    pids = live_pids()
+    if not pids:
+        raise SystemExit("Desktop rollout failed: Desktop process exited")
+    path = pathlib.Path(log_name)
+    lines = path.read_text(errors="replace").splitlines()[start_line:] if path.exists() else []
+    segment = "\n".join(lines)
+    for marker in failure_markers:
+        if marker in segment:
+            raise SystemExit(f"Desktop rollout failed: observed {marker}")
+    if any(marker in segment for marker in ready_markers):
+        ready_at = ready_at or time.monotonic()
+        if time.monotonic() - ready_at >= settle:
+            print(f"Desktop rollout healthy: pid={pids[0]} stable_for={settle:g}s")
+            raise SystemExit(0)
+    time.sleep(0.25)
+raise SystemExit("Desktop rollout failed: no stable ready state before timeout")
+PY
+}
+
+verify_desktop_bundle() {
+  local app="${HERMES_AGENT_DIR}/apps/desktop/release/mac-arm64/Hermes.app"
+  [[ -d "$app" ]] || { err "Desktop bundle missing: $app"; return 1; }
+  if ! "$CODESIGN_BIN" --verify --deep --strict --verbose=2 "$app" 2>&1; then
+    err "Desktop bundle signature is invalid; refusing to restart into a Gatekeeper failure"
+    return 1
+  fi
+  info "Desktop bundle signature: valid on disk ✓"
+}
+
+backup_connection_state() {
+  local backup_dir="$1"
+  mkdir -p "$backup_dir/desktop-data"
+  local name
+  for name in connection.json connections.json; do
+    if [[ -f "$DESKTOP_DATA_DIR/$name" ]]; then
+      ditto "$DESKTOP_DATA_DIR/$name" "$backup_dir/desktop-data/$name"
+    fi
+  done
+}
+
+restore_app_and_connections() {
+  local backup_dir="$1" live_app="$2"
+  if [[ -d "$backup_dir/Hermes.app" ]]; then
+    rm -rf "$live_app"
+    ditto "$backup_dir/Hermes.app" "$live_app"
+  fi
+  local name
+  for name in connection.json connections.json; do
+    if [[ -f "$backup_dir/desktop-data/$name" ]]; then
+      ditto "$backup_dir/desktop-data/$name" "$DESKTOP_DATA_DIR/$name"
+    fi
+  done
+}
+
+rollback_promotion() {
+  local candidate="$1" backup_dir="$2" live_app="$3" reason="$4"
+  err "runtime validation failed: $reason"
+  err "rolling back source, Desktop bundle, connection state, and gateways"
+  if ! managed rollback "$candidate" --reason "$reason" --yes; then
+    err "ROLLBACK FAILED: source rollback was refused; preserving all evidence"
+    return 2
+  fi
+  restore_app_and_connections "$backup_dir" "$live_app"
+  verify_desktop_bundle || { err "ROLLBACK FAILED: previous Desktop bundle signature is invalid"; return 2; }
+  restart_gateways
+  local rollback_log_start
+  rollback_log_start=$(desktop_log_line_count)
+  restart_desktop || { err "ROLLBACK FAILED: previous Desktop did not relaunch"; return 2; }
+  verify_desktop_rollout "$rollback_log_start" || { err "ROLLBACK FAILED: previous Desktop did not become healthy"; return 2; }
+  info "rollback completed and previous Desktop is healthy"
+  return 2
+}
+
 # ─── Modes ───────────────────────────────────────────────────────────────────
 mode_check() {
   bold "=== hermes-safe-update check (read-only) ==="; echo
@@ -245,6 +401,8 @@ mode_check() {
   verify_canary_file      || rc=1
   verify_gateway_postgres || rc=1
   verify_no_stale_claims  || rc=1
+  selected_connection_preflight || rc=1
+  verify_desktop_bundle   || rc=1
   if [[ $rc -eq 0 ]]; then
     info "$(green "ALL INVARIANTS HOLD") — WF is healthy"
   else
@@ -288,7 +446,7 @@ mode_finalize() {
 
 mode_promote() {
   local candidate="${1:-}" confirmation="${2:-}"
-  local old_head backup_dir live_app failed_app
+  local old_head backup_dir live_app
   [[ -n "$candidate" ]] || { err "--promote requires a candidate path"; return 3; }
   [[ "$confirmation" == "--yes" ]] || { err "promotion requires trailing --yes"; return 3; }
   old_head=$(git -C "$HERMES_AGENT_DIR" rev-parse HEAD)
@@ -302,23 +460,45 @@ mode_promote() {
     fi
     ditto "$live_app" "${backup_dir}/Hermes.app"
   fi
-  managed promote "$candidate" --yes
+  backup_connection_state "$backup_dir"
+  managed promote "$candidate" --yes || return 2
   info "building promoted Desktop bundle"
   if ! (cd "$HERMES_AGENT_DIR" && "$HERMES_BIN" desktop --build-only); then
-    err "promoted Desktop build failed; restoring previous app bundle"
-    if [[ -d "${backup_dir}/Hermes.app" ]]; then
-      failed_app="${live_app}.failed.$(date +%s)"
-      [[ ! -e "$live_app" ]] || mv "$live_app" "$failed_app"
-      ditto "${backup_dir}/Hermes.app" "$live_app"
-    fi
-    return 2
+    rollback_promotion "$candidate" "$backup_dir" "$live_app" "promoted Desktop build failed"
+    return $?
+  fi
+  if ! verify_desktop_bundle; then
+    rollback_promotion "$candidate" "$backup_dir" "$live_app" "promoted Desktop bundle failed strict code-signature verification"
+    return $?
+  fi
+  if ! selected_connection_preflight; then
+    rollback_promotion "$candidate" "$backup_dir" "$live_app" "configured Desktop connection preflight failed"
+    return $?
   fi
   restart_gateways
-  restart_desktop
-  mode_check
+  local rollout_log_start
+  rollout_log_start=$(desktop_log_line_count)
+  if ! restart_desktop; then
+    rollback_promotion "$candidate" "$backup_dir" "$live_app" "Desktop did not relaunch"
+    return $?
+  fi
+  if ! verify_desktop_rollout "$rollout_log_start"; then
+    rollback_promotion "$candidate" "$backup_dir" "$live_app" "Desktop boot, ticket, renderer, or stability gate failed"
+    return $?
+  fi
+  if ! mode_check; then
+    rollback_promotion "$candidate" "$backup_dir" "$live_app" "post-promotion workflow invariants failed"
+    return $?
+  fi
+  if ! managed complete "$candidate" --yes; then
+    err "runtime is healthy but publish/receipt completion failed; candidate remains pending and is NOT reported promoted"
+    return 2
+  fi
+  info "promotion committed only after Desktop runtime validation passed"
 }
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
+if [[ "${BIZINA_SAFE_UPDATE_LIB_ONLY:-0}" != "1" ]]; then
 case "${1:-}" in
   --check)   mode_check ;;
   --restore) mode_restore ;;
@@ -338,9 +518,10 @@ Usage:
   hermes-safe-update --verify PATH
                                   run the full fork verification suite in PATH
   hermes-safe-update --promote PATH --yes
-                                  fast-forward the live fork to a verified candidate,
-                                  push it, rebuild/relaunch Desktop, restart gateways,
-                                  and recheck invariants
+                                  stage the verified candidate locally, back up source,
+                                  app, and connection state, then rebuild/relaunch and
+                                  validate Desktop. Publish only after runtime health;
+                                  otherwise automatically roll back the whole transaction
   hermes-safe-update --check      verify current state (read-only)
   hermes-safe-update --restore    just restore the fork branch + restart (no upgrade)
   hermes-safe-update --help       this message
@@ -349,6 +530,10 @@ Invariants enforced after run:
   1. ~/.hermes/hermes-agent is on branch '${FORK_BRANCH}'
   2. ${CANARY_FILE} exists
   3. All ${#AVENGER_PROFILES[@]} Avenger gateways have a postgres connection (worker live)
+  4. The configured Desktop connection passes preflight before restart
+  5. The Desktop bundle passes strict code-signature verification
+  6. Desktop reaches ready state without ticket/boot/renderer failures
+  7. Desktop remains stable for ${DESKTOP_STABILITY_SECONDS}s before publication
 
 Exit codes:
   0 — success, all invariants hold
@@ -365,3 +550,4 @@ EOF
     exit 3
     ;;
 esac
+fi
