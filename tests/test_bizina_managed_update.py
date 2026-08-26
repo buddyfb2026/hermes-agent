@@ -82,6 +82,23 @@ def test_prepare_conflict_retains_candidate_and_lists_paths(tmp_path):
     assert record["candidate_head"] is None
 
 
+def test_finalize_commits_resolved_merge_and_refreshes_receipt(tmp_path):
+    root = repo(tmp_path, conflict=True)
+    candidates = tmp_path / "candidates"
+    assert MODULE.prepare(args(root, candidates)) == 10
+    candidate = candidates / "bizina-next-test"
+    with pytest.raises(MODULE.UpdateError, match="unresolved conflicts"):
+        MODULE.finalize(SimpleNamespace(candidate=candidate))
+    (candidate / "shared.txt").write_text("resolved\n")
+    cmd(candidate, "add", "shared.txt")
+    assert MODULE.finalize(SimpleNamespace(candidate=candidate)) == 0
+    record = json.loads((candidates / "bizina-next-test.receipt.json").read_text())
+    assert record["status"] == "prepared"
+    assert record["conflicts"] == []
+    assert record["candidate_head"] == cmd(candidate, "rev-parse", "HEAD")
+    assert cmd(candidate, "status", "--porcelain") == ""
+
+
 def test_promote_requires_explicit_yes(tmp_path):
     root = repo(tmp_path)
     candidates = tmp_path / "candidates"
