@@ -15926,11 +15926,6 @@ function BotsPane() {
   const staleNotice = error && !live && roster.length
     ? 'Roster refresh failed — showing the last good list.' + (gatewayUp ? '' : ' Waiting for the gateway to reconnect…')
     : null
-  const sessionsWorkspaceBot = roster.find(bot => bot.name === sessionsWorkspaceName)
-
-  if (sessionsWorkspaceBot) {
-    return jsx(ProfileSessionsWorkspace, { bot: sessionsWorkspaceBot })
-  }
 
   const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
 

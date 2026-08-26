@@ -14,6 +14,11 @@ import vm from 'node:vm'
 
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
+test('removed per-bot Sessions workspace leaves no orphaned renderer references', () => {
+  assert.equal(pluginSource.includes('sessionsWorkspaceName'), false)
+  assert.equal(pluginSource.includes('ProfileSessionsWorkspace'), false)
+})
+
 function load({ focusedStoredSessionId = null, paneVisibility = true, openWorkspace = true } = {}) {
   const values = new Map()
   const atom = initial => {
