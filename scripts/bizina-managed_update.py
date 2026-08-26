@@ -156,19 +156,18 @@ def verify(args: argparse.Namespace) -> int:
     if dirty_paths(candidate):
         raise UpdateError("candidate must be committed and clean before verification")
     checks = [
-        ["uv", "run", "--extra", "dev", "--extra", "messaging", "pytest", "tests/gateway/test_hermes_jobs_worker.py", "-q"],
+        ["uvx", "uv@0.9.28", "lock", "--check"],
+        ["uv", "sync", "--locked", "--extra", "dev", "--extra", "messaging"],
+        ["uv", "run", "--no-sync", "pytest", "-q"],
         ["node", "--check", "apps/desktop/src/plugins/hermes-bots/plugin.js"],
-        ["node", "--test", "apps/desktop/src/plugins/hermes-bots/tests/*.mjs"],
+        ["npm", "ci"],
         ["npm", "--workspace", "apps/desktop", "run", "typecheck"],
+        ["npm", "--workspace", "apps/desktop", "test"],
         ["hermes", "desktop", "--build-only"],
     ]
     evidence: list[dict[str, Any]] = []
     for command in checks:
-        shell = len(command) >= 3 and command[:2] == ["node", "--test"]
-        if shell:
-            result = subprocess.run(" ".join(command), cwd=candidate, shell=True, text=True, capture_output=True)
-        else:
-            result = subprocess.run(command, cwd=candidate, text=True, capture_output=True)
+        result = subprocess.run(command, cwd=candidate, text=True, capture_output=True)
         evidence.append({"command": " ".join(command), "exit_code": result.returncode, "output_tail": (result.stdout + result.stderr)[-4000:]})
         if result.returncode:
             receipt.update(status="verification_failed", candidate_head=head(candidate), verification=evidence, verified_at=iso_now())
