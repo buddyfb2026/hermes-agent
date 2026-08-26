@@ -192,7 +192,7 @@ restart_gateways() {
 }
 
 restart_desktop() {
-  local exe="${REPO}/apps/desktop/release/mac-arm64/Hermes.app/Contents/MacOS/Hermes"
+  local exe="${HERMES_AGENT_DIR}/apps/desktop/release/mac-arm64/Hermes.app/Contents/MacOS/Hermes"
   [[ -x "$exe" ]] || { err "Desktop executable missing after build: $exe"; return 1; }
 
   info "restarting Hermes Desktop from promoted source"
@@ -291,9 +291,9 @@ mode_promote() {
   local old_head backup_dir live_app failed_app
   [[ -n "$candidate" ]] || { err "--promote requires a candidate path"; return 3; }
   [[ "$confirmation" == "--yes" ]] || { err "promotion requires trailing --yes"; return 3; }
-  old_head=$(git -C "$REPO" rev-parse HEAD)
+  old_head=$(git -C "$HERMES_AGENT_DIR" rev-parse HEAD)
   backup_dir="${HOME}/.hermes/update-backups/${old_head}"
-  live_app="${REPO}/apps/desktop/release/mac-arm64/Hermes.app"
+  live_app="${HERMES_AGENT_DIR}/apps/desktop/release/mac-arm64/Hermes.app"
   mkdir -p "$backup_dir"
   if [[ -d "$live_app" ]]; then
     info "backing up current Desktop bundle to $backup_dir/Hermes.app"
@@ -304,7 +304,7 @@ mode_promote() {
   fi
   managed promote "$candidate" --yes
   info "building promoted Desktop bundle"
-  if ! (cd "$REPO" && "$HERMES_BIN" desktop --build-only); then
+  if ! (cd "$HERMES_AGENT_DIR" && "$HERMES_BIN" desktop --build-only); then
     err "promoted Desktop build failed; restoring previous app bundle"
     if [[ -d "${backup_dir}/Hermes.app" ]]; then
       failed_app="${live_app}.failed.$(date +%s)"
