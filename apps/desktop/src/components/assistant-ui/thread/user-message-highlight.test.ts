@@ -17,7 +17,9 @@ describe('human turns stand out across chat surfaces', () => {
     expect(botPlugin).toMatch(/isUser \? 'rounded-md border px-2 py-1\.5' : 'px-2 py-1'/)
   })
 
-  it('keeps the HUD bubble on the same blue-accent system', () => {
-    expect(styles).toMatch(/--hud-bubble-fill: color-mix\(in srgb, #60a5fa 20%, var\(--dt-user-bubble\) 65%\)/)
+  it('keeps the redesigned HUD transparent with high-contrast gold user ink', () => {
+    expect(styles).toMatch(/--hud-overlay-ink-user: #ffcf6b/)
+    expect(styles).toMatch(/--hud-bubble-fill: transparent/)
+    expect(styles).toMatch(/--hud-bubble-stroke: transparent/)
   })
 })

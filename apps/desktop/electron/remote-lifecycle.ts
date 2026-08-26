@@ -28,6 +28,7 @@
 import crypto from 'node:crypto'
 
 import { parseRemoteProfileListing } from './connection-registry'
+import { assertBootstrapNotSuperseded } from './ssh-connection'
 
 const LOCKFILE_SCHEMA_VERSION = 2
 // Bumped when the desktop<->dashboard reuse contract changes in a way that makes
@@ -44,6 +45,15 @@ const READY_POLL_INTERVAL_MS = 750
 // while serving several profiles/tools, so raise only the child process limit.
 // Keep startup portable: restricted hosts retain their existing limit.
 const REMOTE_NOFILE_SOFT_LIMIT = 65_536
+
+function classifySshReuseProof(proof, spawnNonce) {
+  return proof?.ok === true &&
+    proof.sshOwnerNonce === spawnNonce &&
+    proof.protocolVersion === PROTOCOL_VERSION &&
+    proof.runtimeIntact !== false
+    ? 'authenticated-ok'
+    : 'authenticated-stale'
+}
 
 function mintToken() {
   return crypto.randomBytes(32).toString('hex')
@@ -496,11 +506,27 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
       ).trim()
 
       void result
-    } catch (cause) {
-      const error: any = new Error('Could not terminate the stale SSH backend.')
-      error.kind = 'transient-transport-error'
-      error.cause = cause
-      throw error
+    } catch {
+      // A backend mid-turn (in-flight LLM call, live MCP children) can ride
+      // out SIGTERM past the 5s graceful wait — and before-quit races this
+      // whole teardown against 6s before closing SSH, so giving up here
+      // reparents the still-running serve to pid 1: the #91668 leak, now on
+      // the quit-during-active-turn path. Escalate to SIGKILL and require a
+      // confirmed exit before treating the record as reclaimed.
+      try {
+        await ssh.exec(
+          `kill -9 ${Number(lock.pid)} 2>/dev/null; ` +
+            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
+            `i=$((i+1)); [ "$i" -ge 20 ] && exit 1; sleep 0.1; done`
+        )
+      } catch (cause) {
+        // Even SIGKILL could not confirm death (D-state, permissions). Keep
+        // the lockfile so the next connect's reap pass retries.
+        const error: any = new Error('Could not terminate the stale SSH backend.')
+        error.kind = 'transient-transport-error'
+        error.cause = cause
+        throw error
+      }
     }
   }
 
@@ -515,6 +541,26 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
   }
 
   await removeLockfile(ssh, ownershipId)
+}
+
+// Normal disconnect (quit, connection switch): reuse cleanupStale so we
+// kill only a provably-owned serve --isolated and drop our lockfile.
+// Closing the SSH transport first is not enough — spawn detaches with
+// setsid/nohup, so the backend reparents to pid 1 and keeps state.db
+// open (#91668).
+async function disconnect(ssh, ownershipId) {
+  if (!ssh || !ownershipId) {
+    return
+  }
+
+  const lock = await readLockfile(ssh, ownershipId)
+
+  if (!lock) {
+    return
+  }
+
+  const pidAlive = await remotePidAlive(ssh, lock.pid)
+  await cleanupStale(ssh, ownershipId, lock, pidAlive)
 }
 
 // Detach so the backend survives the SSH channel closing: setsid (Linux)
@@ -558,7 +604,7 @@ async function scrapeReadyPort(ssh, logPath, { timeoutMs = DEFAULT_READY_TIMEOUT
   const remoteLog = expandRemotePath(logPath)
 
   while (Date.now() < deadline) {
-    assertNotAborted(signal)
+    assertBootstrapNotSuperseded(signal)
 
     if (isAlive && !(await isAlive())) {
       const err: any = new Error('Remote dashboard process exited before announcing its port.')
@@ -696,14 +742,6 @@ async function cancelForwardSafe(deps, localPort, remotePort) {
   }
 }
 
-function assertNotAborted(signal) {
-  if (signal?.aborted) {
-    const error: any = new Error('SSH bootstrap was cancelled.')
-    error.kind = 'superseded'
-    throw error
-  }
-}
-
 function isForwardBindCollision(error) {
   return /address already in use|cannot listen to port|bind.*failed/i.test(String(error?.message || error || ''))
 }
@@ -769,7 +807,7 @@ async function connect(deps) {
 
   const log = msg => rememberLog(`[ssh-lifecycle] ${msg}`)
 
-  assertNotAborted(signal)
+  assertBootstrapNotSuperseded(signal)
   const platform = await probeRemotePlatform(ssh)
   log(`remote platform ${platform.os}/${platform.arch}`)
   const hermesPath = await locateHermes(ssh, remoteHermesPath)
@@ -810,7 +848,7 @@ async function connect(deps) {
       lock.hermesHome === hermesHome
 
     if (reusable) {
-      assertNotAborted(signal)
+      assertBootstrapNotSuperseded(signal)
       const localPort = await openForward(deps, lock.port)
 
       try {
@@ -827,7 +865,7 @@ async function connect(deps) {
         }
 
         if (reuseClassification === 'authenticated-stale') {
-          assertNotAborted(signal)
+          assertBootstrapNotSuperseded(signal)
           await cancelForwardSafe(deps, localPort, lock.port)
           await cleanupStale(ssh, ownershipId, lock)
         } else if (reuseClassification === 'authenticated-ok') {
@@ -840,7 +878,7 @@ async function connect(deps) {
             'reused remote dashboard'
           )
 
-          assertNotAborted(signal)
+          assertBootstrapNotSuperseded(signal)
           log(`reusing remote dashboard pid=${lock.pid} port=${lock.port}`)
 
           return {
@@ -868,12 +906,12 @@ async function connect(deps) {
         throw error
       }
     } else {
-      assertNotAborted(signal)
+      assertBootstrapNotSuperseded(signal)
       await cleanupStale(ssh, ownershipId, lock, pidAlive)
     }
   }
 
-  assertNotAborted(signal)
+  assertBootstrapNotSuperseded(signal)
   const spawnToken = mintToken()
 
   const { pid, spawnNonce, logPath, tokenFilePath } = await spawnRemoteDashboard(ssh, {
@@ -914,21 +952,21 @@ async function connect(deps) {
       isAlive: () => remotePidAlive(ssh, pid),
       signal
     })
-    assertNotAborted(signal)
+    assertBootstrapNotSuperseded(signal)
     log(`remote dashboard bound port ${remotePort}`)
 
     localPort = await openForward(deps, remotePort)
-    assertNotAborted(signal)
+    assertBootstrapNotSuperseded(signal)
     const baseUrl = `http://127.0.0.1:${localPort}`
     await waitForHermes(baseUrl, spawnToken)
-    assertNotAborted(signal)
+    assertBootstrapNotSuperseded(signal)
 
     const token = await adoptOwnedServedToken(adoptServedToken, baseUrl, spawnToken, ssh, pid, 'remote dashboard')
 
-    assertNotAborted(signal)
+    assertBootstrapNotSuperseded(signal)
     const tokenFingerprint = fingerprintToken(token)
     await writeLockfile(ssh, ownershipId, { ...ownedSpawn, port: remotePort, tokenFingerprint })
-    assertNotAborted(signal)
+    assertBootstrapNotSuperseded(signal)
 
     return {
       baseUrl,
@@ -964,9 +1002,11 @@ async function connect(deps) {
 export {
   adoptOwnedServedToken,
   buildSpawnCommand,
+  classifySshReuseProof,
   cleanupStale,
   connect,
   DEFAULT_READY_TIMEOUT_MS,
+  disconnect,
   expandRemotePath,
   fingerprintToken,
   isForwardBindCollision,

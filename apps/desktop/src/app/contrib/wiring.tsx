@@ -16,14 +16,22 @@ import { useLocation, useNavigate } from 'react-router'
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { BootFailureOverlay } from '@/components/boot-failure-overlay'
+import { ConfirmHost } from '@/components/confirm-host'
 import { DesktopInstallOverlay } from '@/components/desktop-install-overlay'
 import { FindBar } from '@/components/find-bar'
 import { GatewayConnectingOverlay } from '@/components/gateway-connecting-overlay'
 import { NotificationStack } from '@/components/notifications'
 import { DesktopOnboardingOverlay } from '@/components/onboarding'
 import { $newSessionTabAction, registerPaneCloser } from '@/components/pane-shell/tree/store'
+import {
+  $workspaceMode,
+  $workspaceNewSessionTarget,
+  $workspaceOwnerKey,
+  setWorkspaceScope
+} from '@/components/pane-shell/workspace-scope'
 import { FloatingPet } from '@/components/pet/floating-pet'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
+import { SendDiagnosticsHost } from '@/components/send-diagnostics-dialog'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getLatestSessionMessages } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
@@ -37,6 +45,7 @@ import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
+import { notify, notifyError } from '@/store/notifications'
 import { $previewTarget } from '@/store/preview'
 import {
   $activeGatewayProfile,
@@ -70,7 +79,7 @@ import {
 } from '@/store/session'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord, stopClientCapture } from '@/store/wake-word'
-import { isAuxiliaryWindow, isHudWindow } from '@/store/windows'
+import { isAuxiliaryWindow, isBrowserWindow, isHudWindow } from '@/store/windows'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
 import { closeWorkspaceTab } from '../chat/close-tab'
@@ -138,6 +147,7 @@ import { useQuickEntryBridge } from './hooks/use-quick-entry-bridge'
 import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
 import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
+import { createSessionRpcDispatcher } from './session-rpc-dispatcher'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
 
@@ -279,7 +289,23 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     setMessages
   })
 
-  const { connectionRef, gateway, gatewayRef, requestGateway } = useGatewayRequest()
+  const { connectionRef, gateway, gatewayRef, requestGateway: ambientRequestGateway } = useGatewayRequest()
+
+  // When chrome stays on the launch backend (Bot Mode / all-profiles
+  // navigation), session-owned RPCs still have to hit the session's backend.
+  // The routing itself lives in createSessionRpcDispatcher (routed by the
+  // session the RPC targets, owner ladder in resolveSessionRpcOwner) so the
+  // exact production dispatcher is what the integration tests drive.
+  const requestGateway = useMemo(
+    () =>
+      createSessionRpcDispatcher({
+        ambientRequest: ambientRequestGateway,
+        runtimeIdByStoredSessionIdRef,
+        selectedStoredSessionIdRef,
+        sessionStateByRuntimeIdRef
+      }),
+    [ambientRequestGateway, runtimeIdByStoredSessionIdRef, selectedStoredSessionIdRef, sessionStateByRuntimeIdRef]
+  )
 
   const { loadMoreMessagingForPlatform, loadMoreSessions, refreshCronJobs, refreshMessagingSessions, refreshSessions } =
     useSessionListActions({ profileScope })
@@ -526,6 +552,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // prefills the MAIN composer right after, so it has to own that surface.
   const startSessionInWorkspace = useCallback(
     (path: null | string, options?: { openTab?: boolean }) => {
+      setWorkspaceScope('sessions')
+
       if (options?.openTab && mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get())) {
         void openNewSessionTile('center', { cwd: path, listed: false })
 
@@ -730,7 +758,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           if (payload?.start_new_session !== false) {
             newSessionInProfile(targetProfile)
           } else {
-            void ensureGatewayProfile(normalizeProfileKey(targetProfile))
+            void ensureGatewayProfile(normalizeProfileKey(targetProfile)).catch((error: unknown) => {
+              // #81094: the voice-path switch must surface its failure too.
+              notifyError(error, `Failed to switch to profile "${normalizeProfileKey(targetProfile)}"`)
+            })
           }
         } else if (payload?.start_new_session !== false) {
           startFreshSessionDraft()
@@ -794,7 +825,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     refreshHermesConfig,
     refreshMessagingSessions,
     refreshSessions,
-    requestGateway
+    requestGateway,
+    updateSessionState
   })
 
   // Electron-main / OS / cross-window integrations: update polling, ⌘W close,
@@ -842,6 +874,36 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // it — Cursor-style. Every click opens a fresh "New session" tab (multiple
   // empty tabs are fine since none touch the session list).
   const openNewSessionTab = useCallback(() => {
+    const workspaceMode = $workspaceMode.get()
+    const workspaceOwnerKey = $workspaceOwnerKey.get()
+    const workspaceNewSessionTarget = $workspaceNewSessionTarget.get()
+
+    if (workspaceMode === 'bots') {
+      if (workspaceNewSessionTarget?.kind !== 'route' || !workspaceOwnerKey) {
+        notify({
+          kind: 'info',
+          message:
+            workspaceNewSessionTarget?.kind === 'blocked'
+              ? workspaceNewSessionTarget.message
+              : 'Select a Bot or group first.'
+        })
+
+        return
+      }
+
+      void openNewSessionTile('center', {
+        listed: false,
+        route: workspaceNewSessionTarget.route,
+        workspaceScope: {
+          ownerRoute: workspaceNewSessionTarget.route,
+          workspaceMode: 'bots',
+          workspaceOwnerKey
+        }
+      })
+
+      return
+    }
+
     void openNewSessionTile('center', { listed: false })
   }, [openNewSessionTile])
 
@@ -1046,10 +1108,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           } as CSSProperties
         }
       >
-        {/* HUD mode has no titlebar to hang these off — the clusters are
-            `fixed`, so without this they'd float over the chat as orphaned
-            buttons. Exits are the ⌘⇧H toggle and ⌘W. */}
-        {!isHudWindow() && (
+        {/* HUD and the popped-out Browser have no titlebar to hang these off —
+            the clusters are `fixed`, so without this they'd float over the
+            surface as orphaned buttons. */}
+        {!isHudWindow() && !isBrowserWindow() && (
           <TitlebarControls
             leftTools={leftTitlebarTools}
             onOpenSettings={() => navigate(SETTINGS_ROUTE)}
@@ -1160,13 +1222,22 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       {/* Toasts above everything. */}
       <NotificationStack />
 
+      {/* Backs confirm() from @/store/confirm — renders only while one is open. */}
+      <ConfirmHost />
+
+      {/* Send Diagnostics consent/upload dialog — driven by $sendDiagnostics
+          (error card action); renders nothing until requested. */}
+      <SendDiagnosticsHost />
+
       {/* Petdex floating mascot — renders nothing unless installed + enabled.
           Never in the HUD: that window is the chat bar and nothing else. */}
-      {!isHudWindow() && <FloatingPet />}
+      {!isHudWindow() && !isBrowserWindow() && <FloatingPet />}
 
       {/* Single persistent xterm host chasing the terminal pane's slot rect.
           The HUD has no terminal pane, so it has nothing to chase. */}
-      {!isHudWindow() && <PersistentTerminal onAddSelectionToChat={composer.addTerminalSelectionAttachment} />}
+      {!isHudWindow() && !isBrowserWindow() && (
+        <PersistentTerminal onAddSelectionToChat={composer.addTerminalSelectionAttachment} />
+      )}
     </ContribWiringContext.Provider>
   )
 }
