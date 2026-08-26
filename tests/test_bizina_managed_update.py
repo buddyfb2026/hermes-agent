@@ -43,6 +43,10 @@ def repo(tmp_path: Path, conflict: bool = False) -> Path:
     stable = cmd(root, "rev-parse", "HEAD")
     cmd(root, "update-ref", "refs/remotes/origin/main", upstream)
     cmd(root, "update-ref", "refs/remotes/fork/stable", stable)
+    fork = tmp_path / "fork.git"
+    subprocess.check_call(["git", "init", "--bare", str(fork)], stdout=subprocess.DEVNULL)
+    cmd(root, "remote", "add", "fork", str(fork))
+    cmd(root, "push", "-u", "fork", "stable")
     return root
 
 
@@ -106,6 +110,69 @@ def test_promote_requires_explicit_yes(tmp_path):
     candidate = candidates / "bizina-next-test"
     with pytest.raises(MODULE.UpdateError, match="requires --yes"):
         MODULE.promote(SimpleNamespace(candidate=candidate, yes=False, fork_remote="fork"))
+
+
+def verified_candidate(tmp_path: Path) -> tuple[Path, Path, Path, str]:
+    root = repo(tmp_path)
+    candidates = tmp_path / "candidates"
+    assert MODULE.prepare(args(root, candidates)) == 0
+    candidate = candidates / "bizina-next-test"
+    receipt = candidates / "bizina-next-test.receipt.json"
+    record = json.loads(receipt.read_text())
+    record.update(status="verified", candidate_head=cmd(candidate, "rev-parse", "HEAD"))
+    MODULE.atomic_json(receipt, record)
+    return root, candidate, receipt, cmd(root, "rev-parse", "HEAD")
+
+
+def test_promote_is_pending_and_does_not_publish_before_runtime_validation(tmp_path):
+    root, candidate, receipt, previous = verified_candidate(tmp_path)
+    remote_before = cmd(root, "rev-parse", "fork/stable")
+
+    assert MODULE.promote(SimpleNamespace(candidate=candidate, yes=True, fork_remote="fork")) == 0
+
+    record = json.loads(receipt.read_text())
+    assert record["status"] == "promotion_pending_validation"
+    assert record["previous_head"] == previous
+    assert record["promoted_head"] == cmd(candidate, "rev-parse", "HEAD") == cmd(root, "rev-parse", "HEAD")
+    assert cmd(root, "rev-parse", "fork/stable") == remote_before
+
+
+def test_complete_publishes_only_the_runtime_validated_head(tmp_path):
+    root, candidate, receipt, _ = verified_candidate(tmp_path)
+    assert MODULE.promote(SimpleNamespace(candidate=candidate, yes=True, fork_remote="fork")) == 0
+
+    assert MODULE.complete(SimpleNamespace(candidate=candidate, yes=True, fork_remote="fork")) == 0
+
+    record = json.loads(receipt.read_text())
+    assert record["status"] == "promoted"
+    assert record["runtime_validation"] == "passed"
+    assert cmd(root, "rev-parse", "fork/stable") == cmd(root, "rev-parse", "HEAD")
+
+
+def test_rollback_restores_exact_previous_head_without_publishing_failed_candidate(tmp_path):
+    root, candidate, receipt, previous = verified_candidate(tmp_path)
+    remote_before = cmd(root, "rev-parse", "fork/stable")
+    assert MODULE.promote(SimpleNamespace(candidate=candidate, yes=True, fork_remote="fork")) == 0
+
+    assert MODULE.rollback(SimpleNamespace(candidate=candidate, yes=True, reason="desktop boot loop")) == 0
+
+    record = json.loads(receipt.read_text())
+    assert record["status"] == "rolled_back"
+    assert record["restored_head"] == previous == cmd(root, "rev-parse", "HEAD")
+    assert record["rollback_reason"] == "desktop boot loop"
+    assert cmd(root, "rev-parse", "fork/stable") == remote_before
+
+
+def test_rollback_refuses_when_live_tree_changed_after_promotion(tmp_path):
+    root, candidate, receipt, _ = verified_candidate(tmp_path)
+    assert MODULE.promote(SimpleNamespace(candidate=candidate, yes=True, fork_remote="fork")) == 0
+    (root / "operator-note.txt").write_text("do not destroy\n")
+
+    with pytest.raises(MODULE.UpdateError, match="dirty"):
+        MODULE.rollback(SimpleNamespace(candidate=candidate, yes=True, reason="test"))
+
+    assert (root / "operator-note.txt").read_text() == "do not destroy\n"
+    assert json.loads(receipt.read_text())["status"] == "promotion_pending_validation"
 
 
 def test_atomic_json_is_mode_0600(tmp_path):
