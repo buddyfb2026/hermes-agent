@@ -718,8 +718,11 @@ class CompressionCommitFence:
 
 # Defaults for the in-agent (non-hygiene) progress-aware compress_context wrap.
 # Mirror hermes_cli.config.DEFAULT_CONFIG["compression"] keys of the same name.
-DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
-DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
+# A silent summary provider should reach the deterministic handoff fallback
+# promptly. Long-running work is preserved by that handoff; holding the UI for
+# ten minutes while an auxiliary stream emits nothing is never useful.
+DEFAULT_CONTEXT_TIMEOUT_SECONDS = 45.0
+DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 60.0
 
 # Shared daemon pool for sync compress_context timeout wraps — analogous to
 # asyncio's default executor used by gateway session hygiene's

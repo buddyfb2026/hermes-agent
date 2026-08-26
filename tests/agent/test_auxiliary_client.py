@@ -37,6 +37,7 @@ from agent.auxiliary_client import (
     _resolve_xai_oauth_for_aux,
     _CodexCompletionsAdapter,
     _pool_runtime_base_url,
+    _effective_aux_timeout,
 )
 
 
@@ -103,6 +104,38 @@ def codex_auth_dir(tmp_path, monkeypatch):
 
 class TestAuxiliaryMaxTokensParam:
     pass
+
+
+class TestAuxiliaryCompressionTimeout:
+    def test_compression_timeout_uses_short_fail_fast_floor(self, monkeypatch):
+        """A configured short timeout must reach deterministic fallback promptly."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_task_timeout", lambda task: 10.0
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_compression_timeout_cap", lambda: 45.0
+        )
+
+        assert _effective_aux_timeout("compression", None) == 45.0
+
+    def test_compression_timeout_is_capped_by_in_agent_budget(self, monkeypatch):
+        """The fallback must run before the host cancels the compression worker."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_task_timeout", lambda task: 120.0
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_compression_timeout_cap", lambda: 45.0
+        )
+
+        assert _effective_aux_timeout("compression", None) == 45.0
+
+    def test_explicit_compression_timeout_is_not_capped(self, monkeypatch):
+        """Callers supplying an explicit deadline retain full control."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_compression_timeout_cap", lambda: 45.0
+        )
+
+        assert _effective_aux_timeout("compression", 90.0) == 90.0
 
 
 

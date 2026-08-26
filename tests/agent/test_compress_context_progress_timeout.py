@@ -24,15 +24,15 @@ from agent.conversation_compression import (
 class TestResolveContextCompressionTimeouts:
     def test_defaults_when_empty_cfg(self):
         idle, ceiling = resolve_context_compression_timeouts({})
-        assert idle == 120.0
-        assert ceiling == 600.0
+        assert idle == 45.0
+        assert ceiling == 60.0
 
     def test_zero_idle_disables_wrapper(self):
         idle, ceiling = resolve_context_compression_timeouts(
             {"context_timeout_seconds": 0}
         )
         assert idle == 0.0
-        assert ceiling == 600.0
+        assert ceiling == 60.0
 
     def test_ceiling_clamped_to_idle(self):
         idle, ceiling = resolve_context_compression_timeouts(

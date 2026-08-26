@@ -8286,14 +8286,18 @@ _DEFAULT_AUX_TIMEOUT = 30.0
 
 # Compression summarises large conversation histories; a reasoning auxiliary
 # model (e.g. Codex / GPT-5.5) can legitimately take longer than the default
-# ``auxiliary.compression.timeout`` (120 s), causing the stream to time out and
+# ``auxiliary.compression.timeout`` (45 s), causing the stream to time out and
 # the compressor to fall back to the deterministic context marker (#54915).
 # This is a bounded *floor* applied only to config-derived compression timeouts
 # — it does not affect other auxiliary tasks and does not override an explicit
 # per-call ``timeout=``.  A floor is harmless for fast compression models
 # (they finish before the deadline) and is a minimum, so a higher config value
 # is kept unchanged.
-_COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
+# Keep the floor short enough that the context compressor can produce its
+# deterministic handoff fallback before the UI is held hostage by a silent
+# provider. Long-running work continues from that durable handoff rather than
+# waiting five minutes for an auxiliary stream that emits nothing.
+_COMPRESSION_TIMEOUT_FLOOR_SECONDS = 45.0
 
 
 def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
@@ -8354,6 +8358,33 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
     return default
 
 
+def _get_compression_timeout_cap() -> Optional[float]:
+    """Return the in-agent compression budget when it is explicitly enabled.
+
+    The auxiliary summary call is one phase of in-agent compression.  It must
+    finish before the host's progress-aware wrapper gives up, otherwise the
+    wrapper fence-cancels the worker and the deterministic handoff fallback
+    never gets a chance to preserve long-running task state.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        return None
+    compression = config.get("compression", {}) if isinstance(config, dict) else {}
+    if not isinstance(compression, dict):
+        return None
+    raw = compression.get("context_timeout_seconds")
+    if not isinstance(raw, (int, float, str)):
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     """Resolve the effective timeout for an auxiliary LLM call.
 
@@ -8364,10 +8395,16 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     (#54915).  The floor is intentionally skipped when the caller passes an
     explicit ``timeout=`` — explicit per-call deadlines are always honoured —
     and it is a minimum (``max``), so a config value already above it is kept.
+    The resulting compression call is then capped to the active in-agent
+    compression budget, so its normal deterministic-handoff failure path runs
+    before the host wrapper can fence-cancel the entire compression attempt.
     """
     effective = timeout if timeout is not None else _get_task_timeout(task)
     if timeout is None and task == "compression":
         effective = max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS)
+        cap = _get_compression_timeout_cap()
+        if cap is not None:
+            effective = min(effective, cap)
     return effective
 
 
