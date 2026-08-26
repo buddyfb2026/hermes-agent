@@ -89,7 +89,11 @@ export function AboutSettings() {
     statusLine = a.installing
     statusTone = 'available'
   } else if (updateAvailable) {
-    statusLine = behind > 0 ? a.updateReady(behind) : a.updateReadyUnknown
+    statusLine = status?.managed && status.message
+      ? status.message
+      : behind > 0
+        ? a.updateReady(behind)
+        : a.updateReadyUnknown
     statusTone = 'available'
   } else if (status) {
     statusLine = a.onLatest
@@ -174,7 +178,7 @@ export function AboutSettings() {
             {updateAvailable && supported && !applying && (
               <>
                 <Button onClick={() => startActiveUpdate()} size="sm">
-                  {a.updateNow}
+                  {status?.managed ? 'Prepare candidate' : a.updateNow}
                 </Button>
                 <Button onClick={() => openUpdatesWindow()} size="sm" variant="textStrong">
                   {a.seeWhatsNew}

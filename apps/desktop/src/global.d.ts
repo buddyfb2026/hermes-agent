@@ -534,6 +534,10 @@ export interface DesktopUpdateCommit {
 
 export interface DesktopUpdateStatus {
   supported: boolean
+  /** True when this checkout uses candidate/verify/promote instead of direct upstream mutation. */
+  managed?: boolean
+  /** Custom commits carried on top of upstream by the managed channel. */
+  carried?: number
   updateAvailable?: boolean
   branch?: string
   currentBranch?: string
@@ -574,6 +578,9 @@ export interface DesktopUpdateApplyOptions {
 
 export interface DesktopUpdateApplyResult {
   ok: boolean
+  managed?: boolean
+  candidateRoot?: string
+  conflicts?: string[]
   branch?: string
   error?: string
   message?: string

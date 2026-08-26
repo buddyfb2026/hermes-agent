@@ -319,6 +319,12 @@ import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
+  isManagedBizinaBranch,
+  managedNextCommand,
+  managedUpdaterPath,
+  parseManagedPrepareRecord
+} from './bizina-managed-update'
+import {
   collectRelaunchArgs,
   observeUpdaterHandoff,
   resolvePosixScriptHandoff,
@@ -2731,6 +2737,58 @@ async function resolveHealedBranch(updateRoot, branch) {
   return 'main'
 }
 
+async function runManagedBizinaUpdater(updateRoot, action) {
+  const script = managedUpdaterPath(updateRoot)
+  return await new Promise<{ code: number; stdout: string; stderr: string }>(resolve => {
+    execFile('/usr/bin/python3', [script, action], { cwd: updateRoot, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+      resolve({ code: typeof error?.code === 'number' ? error.code : error ? 1 : 0, stdout: String(stdout || ''), stderr: String(stderr || '') })
+    })
+  })
+}
+
+async function checkManagedBizinaUpdates(updateRoot, currentBranch) {
+  await clearStaleGitLocks(updateRoot)
+  const fetched = await runGit(['fetch', '--quiet', 'origin', 'main'], { cwd: updateRoot })
+  if (fetched.code !== 0) {
+    return {
+      supported: true,
+      managed: true,
+      branch: currentBranch,
+      currentBranch,
+      error: 'fetch-failed',
+      message: firstLine(fetched.stderr) || 'git fetch origin main failed.',
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
+  const git = args => runGit(args, { cwd: updateRoot }).then(result => result.stdout.trim())
+  const [currentSha, targetSha, counts, dirtyStr] = await Promise.all([
+    git(['rev-parse', 'HEAD']),
+    git(['rev-parse', 'origin/main']),
+    git(['rev-list', '--left-right', '--count', 'origin/main...HEAD']),
+    git(['status', '--porcelain'])
+  ])
+  const [behindRaw = '0', aheadRaw = '0'] = counts.split(/\s+/)
+  const behind = Number.parseInt(behindRaw, 10) || 0
+  const carried = Number.parseInt(aheadRaw, 10) || 0
+  return {
+    supported: true,
+    managed: true,
+    branch: currentBranch,
+    currentBranch,
+    behind,
+    carried,
+    updateAvailable: behind > 0,
+    currentSha,
+    targetSha,
+    commits: [],
+    dirty: dirtyStr.length > 0,
+    message: `Managed Bizina build · ${behind} upstream commit(s) available · ${carried} Bizina commit(s) carried`,
+    hermesRoot: updateRoot,
+    fetchedAt: Date.now()
+  }
+}
+
 async function checkUpdates() {
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
@@ -2744,6 +2802,12 @@ async function checkUpdates() {
       hermesRoot: updateRoot,
       branch
     }
+  }
+
+  const currentBranchProbe = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
+  const checkedOutBranch = (currentBranchProbe.stdout || '').trim()
+  if (isManagedBizinaBranch(checkedOutBranch, fileExists(managedUpdaterPath(updateRoot)))) {
+    return await checkManagedBizinaUpdates(updateRoot, checkedOutBranch)
   }
 
   branch = await resolveHealedBranch(updateRoot, branch)
@@ -3451,6 +3515,37 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
   updateInFlight = true
 
   try {
+    const managedRoot = resolveUpdateRoot()
+    const currentBranchProbe = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: managedRoot })
+    const currentBranch = (currentBranchProbe.stdout || '').trim()
+    if (isManagedBizinaBranch(currentBranch, fileExists(managedUpdaterPath(managedRoot)))) {
+      emitUpdateProgress({ stage: 'download', message: 'Preparing a clean Bizina integration candidate. The running app will not change.', percent: null })
+      const prepared = await runManagedBizinaUpdater(managedRoot, 'prepare')
+      const record = parseManagedPrepareRecord(prepared.stdout)
+      if (!record || ![0, 10].includes(prepared.code)) {
+        const message = firstLine(prepared.stderr) || 'Managed candidate preparation failed.'
+        emitUpdateProgress({ stage: 'error', message, percent: null })
+        return { ok: false, managed: true, error: 'managed-prepare-failed', message }
+      }
+      const conflicts = record.conflicts || []
+      const message = record.status === 'prepared'
+        ? `Bizina candidate prepared at ${record.candidate_root}. Verify it before promotion; the running app is unchanged.`
+        : `Bizina candidate prepared with ${conflicts.length} conflict(s) at ${record.candidate_root}. The running app is unchanged.`
+      const command = managedNextCommand(record)
+      emitUpdateProgress({ stage: 'manual', message: command, percent: null })
+      return {
+        ok: true,
+        managed: true,
+        manual: true,
+        command,
+        message,
+        candidateRoot: record.candidate_root,
+        conflicts,
+        branch: currentBranch,
+        hermesRoot: managedRoot
+      }
+    }
+
     const updater = resolveUpdaterBinary()
 
     if (!updater && !IS_WINDOWS) {
