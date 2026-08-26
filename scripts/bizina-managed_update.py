@@ -128,6 +128,25 @@ def load_receipt(candidate: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def finalize(args: argparse.Namespace) -> int:
+    candidate = args.candidate.resolve()
+    receipt = load_receipt(candidate)
+    if receipt.get("candidate_root") != str(candidate):
+        raise UpdateError("receipt candidate_root mismatch")
+    conflicts = git(candidate, "diff", "--name-only", "--diff-filter=U").stdout.splitlines()
+    if conflicts:
+        raise UpdateError("unresolved conflicts: " + ", ".join(conflicts))
+    merge_head = git(candidate, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).stdout.strip()
+    if not merge_head:
+        raise UpdateError("candidate is not an in-progress merge")
+    git(candidate, "diff", "--cached", "--check")
+    git(candidate, "commit", "-m", f"Merge {receipt['upstream_ref']} into Bizina candidate")
+    receipt.update(status="prepared", candidate_head=head(candidate), conflicts=[], finalized_at=iso_now())
+    atomic_json(candidate_receipt(candidate), receipt)
+    print(json.dumps(receipt, indent=2))
+    return 0
+
+
 def verify(args: argparse.Namespace) -> int:
     candidate = args.candidate.resolve()
     receipt = load_receipt(candidate)
@@ -214,6 +233,8 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="action", required=True)
     prep = sub.add_parser("prepare")
     prep.add_argument("--stamp")
+    fin = sub.add_parser("finalize")
+    fin.add_argument("candidate", type=Path)
     ver = sub.add_parser("verify")
     ver.add_argument("candidate", type=Path)
     pro = sub.add_parser("promote")
@@ -226,7 +247,7 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        return {"prepare": prepare, "verify": verify, "promote": promote, "status": status}[args.action](args)
+        return {"prepare": prepare, "finalize": finalize, "verify": verify, "promote": promote, "status": status}[args.action](args)
     except UpdateError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
