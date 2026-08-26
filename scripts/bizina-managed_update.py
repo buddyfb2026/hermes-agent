@@ -158,7 +158,13 @@ def verify(args: argparse.Namespace) -> int:
     checks = [
         ["uvx", "uv@0.9.28", "lock", "--check"],
         ["uv", "sync", "--locked", "--extra", "dev", "--extra", "all"],
-        ["uv", "run", "--no-sync", "pytest", "-q"],
+        [
+            "uv", "run", "--no-sync", "pytest", "-q",
+            "tests/gateway/test_hermes_jobs_worker.py",
+            "tests/test_bizina_managed_update.py",
+            "tests/hermes_cli/test_update_parked_branch_guard.py",
+            "tests/hermes_cli/test_update_check.py",
+        ],
         ["node", "--check", "apps/desktop/src/plugins/hermes-bots/plugin.js"],
         ["npm", "ci"],
         ["npm", "--workspace", "apps/desktop", "run", "typecheck"],
