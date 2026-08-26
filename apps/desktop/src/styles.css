@@ -1504,6 +1504,17 @@ body.guest-pointer-lock :is(webview, iframe) {
   top: var(--sticky-human-top);
 }
 
+/* Spencer's turns are the decision/input boundary in long operational chats.
+   Give them one consistent blue-tinted card treatment across normal chats,
+   Bot chats and Group Chats without recoloring assistant/tool output. Mixing
+   into each theme's own bubble keeps light/dark/custom-theme contrast intact. */
+[data-slot='aui_user-message-root'] .composer-human-message,
+[data-group-user-message='true'] {
+  background: color-mix(in srgb, #60a5fa 20%, var(--dt-user-bubble)) !important;
+  border-color: color-mix(in srgb, #3b82f6 55%, var(--dt-user-bubble-border)) !important;
+  box-shadow: inset 3px 0 0 color-mix(in srgb, #3b82f6 82%, transparent);
+}
+
 [data-slot='aui_user-message-root'],
 [data-slot='aui_edit-composer-root'] {
   --human-msg-line-height: 1.3;
@@ -2722,7 +2733,7 @@ button[data-slot='aui_msg-reactions'] svg {
    engaged. ONE variable carries the fill so there is no specificity fight
    between rest/engaged rules — the states just move the var. */
 [data-hud-shell] {
-  --hud-bubble-fill: color-mix(in srgb, var(--dt-user-bubble) 65%, transparent);
+  --hud-bubble-fill: color-mix(in srgb, #60a5fa 20%, var(--dt-user-bubble) 65%);
 }
 
 /* ONE opacity law for the whole band: solid on focus, material otherwise.
@@ -2753,7 +2764,7 @@ button[data-slot='aui_msg-reactions'] svg {
    Fill and border both ride the same variable, so they cannot desync. */
 [data-hud-shell] .composer-human-message {
   background: var(--hud-bubble-fill) !important;
-  border-color: color-mix(in srgb, var(--ui-stroke-secondary) 45%, transparent) !important;
+  border-color: color-mix(in srgb, #3b82f6 50%, var(--ui-stroke-secondary)) !important;
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
   transition:

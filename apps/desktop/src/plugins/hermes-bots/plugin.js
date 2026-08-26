@@ -10271,8 +10271,9 @@ function GroupChatWorkspace({ group, members, onBack }) {
                   return jsxs('div', {
                     className: cn(
                       'group flex items-start gap-2',
-                      isUser ? 'rounded-md bg-(--chrome-action-hover) px-2 py-1.5' : 'px-2 py-1'
+                      isUser ? 'rounded-md border px-2 py-1.5' : 'px-2 py-1'
                     ),
+                    'data-group-user-message': isUser ? 'true' : undefined,
                     children: [
                       isUser
                         ? null
