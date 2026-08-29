@@ -50,6 +50,7 @@ import {
   refreshActiveProfile,
   touchActiveGatewayBackend
 } from '@/store/profile'
+import { resetApprovalReplayGuard } from '@/store/prompts'
 import {
   $activeSessionId,
   $connection,
@@ -348,6 +349,7 @@ export function useGatewayBoot({
         // those ids may be live again after re-resume — clear the latch with
         // the same lifetime as the runtime bindings it shadows.
         resetBackgroundPollingGuard()
+        resetApprovalReplayGuard()
         // Same staleness, other half: pre-reconnect busy flags are keyed by
         // those dead runtime ids and would never receive their terminal
         // busy:false — clear them or the sidebar running arc lies forever

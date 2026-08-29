@@ -484,6 +484,11 @@ async function openSecondary(entry: Secondary): Promise<void> {
         .catch(() => {
           // Best effort for partial test/HMR graphs, same as above.
         })
+      void import('@/store/prompts')
+        .then(({ resetApprovalReplayGuard }) => resetApprovalReplayGuard())
+        .catch(() => {
+          // Best effort for partial test/HMR graphs, same as above.
+        })
     }
 
     // Registry-scoped entries dial through getConnectionFor when the bridge has

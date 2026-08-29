@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { JsonRpcGatewayError } from '@hermes/shared'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { clearClarifyRequest, setClarifyRequest } from './clarify'
 import {
@@ -10,8 +11,10 @@ import {
   clearApprovalRequest,
   clearSecretRequest,
   clearSudoRequest,
+  isSessionGoneForApprovalReplay,
   receiveApprovalRequest,
   replayPendingApproval,
+  resetApprovalReplayGuard,
   setApprovalRequest,
   setSecretRequest,
   setSudoRequest
@@ -22,11 +25,13 @@ import { $activeSessionId } from './session'
 // active session, so each test focuses the session it's asserting on.
 beforeEach(() => {
   $activeSessionId.set('s1')
+  resetApprovalReplayGuard()
 })
 
 afterEach(() => {
   clearAllPrompts()
   clearClarifyRequest()
+  resetApprovalReplayGuard()
   $activeSessionId.set(null)
 })
 
@@ -128,6 +133,85 @@ describe('approval prompt store', () => {
       ['approval.pending', { session_id: 's1' }],
       ['approval.received', { request_id: 'r1', session_id: 's1' }]
     ])
+  })
+
+  it('classifies only a structured 4001, or a legacy codeless gone message, as terminal', () => {
+    expect(isSessionGoneForApprovalReplay(new JsonRpcGatewayError('gone', { code: 4001 }))).toBe(true)
+    expect(
+      isSessionGoneForApprovalReplay(
+        new JsonRpcGatewayError('tool failed: session not found', { code: 5007 })
+      )
+    ).toBe(false)
+    expect(isSessionGoneForApprovalReplay(new Error('session not found'))).toBe(true)
+    expect(isSessionGoneForApprovalReplay(new Error('request timed out'))).toBe(false)
+  })
+
+  it('stops replaying after a runtime is authoritatively reported gone', async () => {
+    const request = vi.fn(async () => {
+      throw new JsonRpcGatewayError('session not found', { code: 4001 })
+    })
+
+    const gateway = { request }
+
+    await replayPendingApproval(gateway, 'dead')
+    await replayPendingApproval(gateway, 'dead')
+    await replayPendingApproval(gateway, 'dead')
+
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps retrying transient replay failures', async () => {
+    const request = vi.fn(async () => {
+      throw new Error('request timed out')
+    })
+
+    const gateway = { request }
+
+    await expect(replayPendingApproval(gateway, 'live')).rejects.toThrow('request timed out')
+    await expect(replayPendingApproval(gateway, 'live')).rejects.toThrow('request timed out')
+
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
+  it('coalesces simultaneous event-burst replays for one runtime', async () => {
+    let release!: () => void
+
+    const pending = new Promise<void>(resolve => {
+      release = resolve
+    })
+
+    const request = vi.fn(async () => {
+      await pending
+
+      return { approvals: [] }
+    })
+
+    const gateway = { request }
+    const first = replayPendingApproval(gateway, 'burst')
+    const second = replayPendingApproval(gateway, 'burst')
+    const third = replayPendingApproval(gateway, 'burst')
+
+    release()
+    await Promise.all([first, second, third])
+
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('allows replay again after a runtime-generation reset', async () => {
+    const request = vi.fn(async () => {
+      throw new JsonRpcGatewayError('session not found', { code: 4001 })
+    })
+
+    const gateway = { request }
+
+    await replayPendingApproval(gateway, 'rebound')
+    await replayPendingApproval(gateway, 'rebound')
+    expect(request).toHaveBeenCalledTimes(1)
+
+    resetApprovalReplayGuard('rebound')
+    await replayPendingApproval(gateway, 'rebound')
+
+    expect(request).toHaveBeenCalledTimes(2)
   })
 })
 

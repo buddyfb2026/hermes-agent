@@ -1,3 +1,4 @@
+import { JsonRpcGatewayError } from '@hermes/shared'
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { $clarifyRequest, $clarifyRequests } from './clarify'
@@ -84,6 +85,42 @@ interface ApprovalGateway {
   request: (method: string, params: Record<string, unknown>) => Promise<unknown>
 }
 
+/** Runtime ids whose approval registry the gateway has authoritatively reported
+ * gone. Gateway event bursts can ask for approval replay several times per
+ * second; retrying a detached/reaped runtime on every event produces a permanent
+ * 4001 loop, repaints the active surface and can steal composer focus. */
+const goneApprovalReplaySessions = new Set<string>()
+
+/** Coalesce one event burst into one approval.pending RPC per runtime. */
+const approvalReplayInFlight = new Map<string, Promise<void>>()
+
+const GATEWAY_SESSION_NOT_FOUND_CODE = 4001
+
+export function isSessionGoneForApprovalReplay(error: unknown): boolean {
+  if (error instanceof JsonRpcGatewayError && typeof error.code === 'number') {
+    return error.code === GATEWAY_SESSION_NOT_FOUND_CODE
+  }
+
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  return /session not found|not in memory.*detached\/reaped runtime/i.test(message)
+}
+
+/** A backend reconnect/rebind can mint a live runtime under an id previously
+ * reported gone. Reset all latches at that generation boundary, or one exact id
+ * when a caller has direct proof of a fresh binding. */
+export function resetApprovalReplayGuard(sessionId?: string): void {
+  if (sessionId) {
+    goneApprovalReplaySessions.delete(sessionId)
+    approvalReplayInFlight.delete(sessionId)
+
+    return
+  }
+
+  goneApprovalReplaySessions.clear()
+  approvalReplayInFlight.clear()
+}
+
 interface PendingApprovalPayload {
   allow_permanent?: boolean
   choices?: unknown
@@ -127,32 +164,63 @@ export async function receiveApprovalRequest(gateway: ApprovalGateway | null, re
 }
 
 export async function replayPendingApproval(gateway: ApprovalGateway | null, sessionId: string | null): Promise<void> {
-  if (!gateway || !sessionId) {
+  if (!gateway || !sessionId || goneApprovalReplaySessions.has(sessionId)) {
     return
   }
 
-  const rawResult = await gateway.request('approval.pending', {
-    session_id: sessionId
-  })
+  const existing = approvalReplayInFlight.get(sessionId)
 
-  const result =
-    rawResult && typeof rawResult === 'object' ? (rawResult as { approvals?: PendingApprovalPayload[] }) : {}
+  if (existing) {
+    await existing
 
-  const pending = Array.isArray(result?.approvals) ? result.approvals[0] : undefined
-
-  if (!pending || typeof pending.request_id !== 'string') {
     return
   }
 
-  await receiveApprovalRequest(gateway, {
-    allowPermanent: pending.allow_permanent !== false,
-    choices: Array.isArray(pending.choices) ? pending.choices.filter(choice => typeof choice === 'string') : undefined,
-    command: typeof pending.command === 'string' ? pending.command : '',
-    description: typeof pending.description === 'string' ? pending.description : 'dangerous command',
-    requestId: pending.request_id,
-    sessionId,
-    smartDenied: pending.smart_denied === true
-  })
+  const run = (async () => {
+    try {
+      const rawResult = await gateway.request('approval.pending', {
+        session_id: sessionId
+      })
+
+      const result =
+        rawResult && typeof rawResult === 'object' ? (rawResult as { approvals?: PendingApprovalPayload[] }) : {}
+
+      const pending = Array.isArray(result?.approvals) ? result.approvals[0] : undefined
+
+      if (!pending || typeof pending.request_id !== 'string') {
+        return
+      }
+
+      await receiveApprovalRequest(gateway, {
+        allowPermanent: pending.allow_permanent !== false,
+        choices: Array.isArray(pending.choices) ? pending.choices.filter(choice => typeof choice === 'string') : undefined,
+        command: typeof pending.command === 'string' ? pending.command : '',
+        description: typeof pending.description === 'string' ? pending.description : 'dangerous command',
+        requestId: pending.request_id,
+        sessionId,
+        smartDenied: pending.smart_denied === true
+      })
+    } catch (error) {
+      if (isSessionGoneForApprovalReplay(error)) {
+        goneApprovalReplaySessions.add(sessionId)
+        clearApprovalRequest(sessionId)
+
+        return
+      }
+
+      throw error
+    }
+  })()
+
+  approvalReplayInFlight.set(sessionId, run)
+
+  try {
+    await run
+  } finally {
+    if (approvalReplayInFlight.get(sessionId) === run) {
+      approvalReplayInFlight.delete(sessionId)
+    }
+  }
 }
 
 /** The prompt request for one specific session — the tile counterpart of the
